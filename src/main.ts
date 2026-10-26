@@ -1383,6 +1383,7 @@ Object.assign(window, {
 
 const participantsEl = document.querySelector<HTMLDivElement>("#participants")!;
 let participantsAt = 0;
+const SILENT = { low: 0, mid: 0, high: 0 };
 let facesAt = 0;
 let breathAt = 0;
 // idle interference: every 25-70 s the channel hiccups on its own
@@ -1413,6 +1414,7 @@ function frame() {
         ? speakLevel
         : 0;
 
+  scene.voiceBands = speaker.vader.speaking ? speaker.vader.bands() : SILENT;
   scene.render();
   drawCamView();
   // participant tiles: 10 updates a second is plenty for gaze and hands

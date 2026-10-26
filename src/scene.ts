@@ -162,6 +162,9 @@ export class OctaScene {
 
   /** Live voice level, 0..1 — set every frame while listening/speaking. */
   level = 0;
+  /** Octa's own voice by band (0..1): low ~80-300 Hz, mid ~0.3-2 kHz, high ~2-6 kHz. */
+  voiceBands = { low: 0, mid: 0, high: 0 };
+  private vib = { low: 0, mid: 0, high: 0 };
   private smoothedLevel = 0;
 
   state: OctaState = "idle";
@@ -1041,10 +1044,25 @@ export class OctaScene {
         : 0;
     const breathe = this.state === "thinking" ? Math.sin(t * 3.2) * 0.03 : 0;
     const s = (p.scale + voiceScale + breathe) * this.pulseScale.v * this.shapeScale.v * this.glitchJolt.s;
-    this.octa.scale.setScalar(s);
 
-    this.octa.position.y = Math.sin(t * 1.1) * p.floatAmp + this.glitchJolt.y;
-    this.octa.position.x = this.glitchJolt.x;
+    // the body resonates with its own voice: lows swell it, mids stretch it
+    // upward, highs make it shiver — small, fast, and only while it talks
+    const vb = this.voiceBands;
+    const k = 1 - Math.exp(-dt * 30);
+    this.vib.low += (vb.low - this.vib.low) * k;
+    this.vib.mid += (vb.mid - this.vib.mid) * k;
+    this.vib.high += (vb.high - this.vib.high) * k;
+    const { low, mid, high } = this.vib;
+    this.octa.scale.set(
+      s * (1 + low * 0.05 + Math.sin(t * 47) * high * 0.012),
+      s * (1 + mid * 0.045 + Math.sin(t * 61) * high * 0.014),
+      s * (1 + low * 0.03 + Math.sin(t * 53) * high * 0.01)
+    );
+
+    this.octa.position.y = Math.sin(t * 1.1) * p.floatAmp + this.glitchJolt.y + Math.sin(t * 71) * mid * 0.006;
+    this.octa.position.x = this.glitchJolt.x + Math.sin(t * 83) * high * 0.007;
+    // the edges flicker on the sibilants
+    this.edgeMat.opacity = 0.9 - high * 0.35 * Math.abs(Math.sin(t * 97));
 
     // panels: bob + fast-reactive pan/zoom lerp; streaming ones redraw
     const viewAlpha = 1 - Math.exp(-dt * 22);

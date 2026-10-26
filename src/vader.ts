@@ -200,6 +200,7 @@ export class VaderVoice {
   private input: GainNode | null = null;
   private crushIn: GainNode | null = null; // same chain, but through a bitcrusher first
   private carrierOscs: OscillatorNode[] = [];
+  private bandPeak = { low: 0.05, mid: 0.05, high: 0.05 };
   private room: GainNode | null = null; // reverb send
   /** Fired as a voice glitch plays — the scene glitches with it. */
   onGlitch: (strength: number, ms: number) => void = () => {};
@@ -312,6 +313,10 @@ export class VaderVoice {
     limiter.release.value = 0.12;
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 512;
+    // a narrower dB window than the default (-100..-30), so bands track the
+    // speech instead of sitting at full scale
+    analyser.minDecibels = -75;
+    analyser.maxDecibels = -15;
     mix.connect(shaper);
     shaper.connect(out);
     shaper.connect(comb);
@@ -410,6 +415,35 @@ export class VaderVoice {
       o.frequency.setValueAtTime(f * factor, at);
       o.frequency.setValueAtTime(f, at + Math.min(0.25, dur));
     }
+  }
+
+  /** Octa's voice by band, 0..1 — what makes the body vibrate. */
+  bands(): { low: number; mid: number; high: number } {
+    if (!this.analyser || !this.ctx) return { low: 0, mid: 0, high: 0 };
+    const bins = new Uint8Array(this.analyser.frequencyBinCount);
+    this.analyser.getByteFrequencyData(bins);
+    const hz = this.ctx.sampleRate / this.analyser.fftSize;
+    const avg = (f0: number, f1: number) => {
+      let sum = 0;
+      let n = 0;
+      for (let i = Math.floor(f0 / hz); i <= Math.ceil(f1 / hz) && i < bins.length; i++) {
+        sum += bins[i];
+        n++;
+      }
+      return n ? sum / n / 255 : 0;
+    };
+    // each band against its own recent peak: the vocoder puts far more energy
+    // in the lows, so one fixed scale would leave mids and highs flat
+    const norm = (key: "low" | "mid" | "high", raw: number) => {
+      this.bandPeak[key] = Math.max(raw, this.bandPeak[key] * 0.995, 0.05);
+      const x = raw / this.bandPeak[key];
+      return Math.min(1, Math.max(0, (x - 0.35) / 0.65)); // below ~a third of peak = still
+    };
+    return {
+      low: norm("low", avg(80, 300)),
+      mid: norm("mid", avg(300, 2000)),
+      high: norm("high", avg(2000, 6000)),
+    };
   }
 
   /** Open the audio context inside a user gesture (the Begin click), so idle
