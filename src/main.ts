@@ -469,14 +469,19 @@ async function converse() {
       ? "heard · lips not checked"
       : mouth.spoke
         ? `heard P${mouth.holder} ✓`
-        : `dropped · P${mouth.holder} wasn't talking to Octa`,
+        : `dropped · P${mouth.holder} lips ${mouth.movingMs}ms`,
     ok: !mouth || mouth.spoke,
     at: performance.now(),
   };
   if (mouth && !mouth.spoke) {
-    console.info(`[floor] dropped "${heard}" — P${mouth.holder} wasn't facing Octa and speaking`);
+    console.info(
+      `[floor] dropped "${heard}" — P${mouth.holder}: lips ${mouth.movingMs}ms, to Octa ${mouth.toOctaMs}ms, alone ${mouth.alone}`
+    );
     setState("speaking");
-    const msg = `Jeg hørte noen, men P${mouth.holder} har ordet. Rekk opp hånden, så velger jeg deg etterpå.`;
+    // alone in view: the voice came from off camera — don't tell anyone to raise a hand
+    const msg = mouth.alone
+      ? "Jeg så ikke at du snakket. Si det gjerne igjen."
+      : `Jeg hørte noen, men P${mouth.holder} har ordet. De andre kan rekke opp hånden.`;
     showTranscript(msg);
     await speaker.speak(msg, () => {
       scene.pulse(1);

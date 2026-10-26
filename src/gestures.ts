@@ -71,7 +71,12 @@ const MAX_FACES = 6;
 const MOUTH_LOG_MS = 60000; // how much lip history each person keeps
 const MOUTH_WINDOW = 600; // ms — lips "moving" = gap range over this window…
 const MOUTH_MOVING = 0.025; // …exceeds this share of face height
-const MOUTH_SPOKE = 0.12; // share of face samples that must be "moving" to count as speaking
+// Speech is judged by how LONG the lips moved, not by what share of the capture
+// they moved: a voice behind you keeps the recognizer listening, which stretches
+// the capture and would dilute any share-based test.
+const SPOKE_TO_OCTA_MS = 300; // lips moving while facing Octa
+const SPOKE_LOOSE_MS = 450; // lips moving, facing Octa for part of it
+const SPOKE_ALONE_MS = 250; // only one face in view: lips moving at all
 // "looking at Octa" = face turned toward the camera (which sits by the screen):
 const GAZE_YAW = 0.13; // nose offset from the cheek midpoint, share of face width
 const GAZE_PITCH: [number, number] = [0.22, 0.62]; // nose between eye line (0) and chin (1)
@@ -96,9 +101,39 @@ interface Person {
 /** Did the floor holder's lips move during a capture? */
 export interface MouthCheck {
   holder: number;
-  spoke: boolean; // lips moving while facing Octa — what the gate uses
-  facing: boolean; // mostly facing Octa during the capture
-  moving: boolean; // lips moving at all during the capture
+  spoke: boolean; // what the gate uses — see judgeSpeech
+  facing: boolean; // facing Octa for a good part of the capture
+  moving: boolean; // lips moved for a meaningful stretch
+  alone: boolean; // the holder was the only face in view
+  movingMs: number;
+  toOctaMs: number; // lips moving while facing Octa
+}
+
+type MouthSample = { t: number; moving: boolean; looking: boolean };
+
+/** Decide whether the floor holder spoke during a capture of `spanMs`. */
+export function judgeSpeech(
+  samples: MouthSample[],
+  spanMs: number,
+  alone: boolean
+): Omit<MouthCheck, "holder"> {
+  const dt = spanMs / Math.max(1, samples.length); // time each face sample stands for
+  const count = (f: (m: MouthSample) => boolean) => samples.filter(f).length;
+  const movingMs = count((m) => m.moving) * dt;
+  const toOctaMs = count((m) => m.moving && m.looking) * dt;
+  const facingShare = count((m) => m.looking) / Math.max(1, samples.length);
+  const spoke =
+    toOctaMs >= SPOKE_TO_OCTA_MS ||
+    (movingMs >= SPOKE_LOOSE_MS && facingShare >= 0.25) ||
+    (alone && movingMs >= SPOKE_ALONE_MS);
+  return {
+    spoke,
+    facing: facingShare >= 0.5,
+    moving: movingMs >= SPOKE_ALONE_MS,
+    alone,
+    movingMs: Math.round(movingMs),
+    toOctaMs: Math.round(toOctaMs),
+  };
 }
 
 interface HandTrack {
@@ -293,15 +328,7 @@ export class GestureControl {
     const span = performance.now() - since;
     // face frames run at roughly 20/s; under a third of that coverage → can't tell
     if (samples.length < Math.max(3, (span / 1000) * 20 * 0.33)) return null;
-    // it only counts as theirs if they spoke *to Octa*: lips moving while facing it
-    const share = (f: (m: Person["mouth"][number]) => boolean) =>
-      samples.filter(f).length / samples.length;
-    return {
-      holder,
-      spoke: share((m) => m.moving && m.looking) >= MOUTH_SPOKE,
-      facing: share((m) => m.looking) >= 0.5,
-      moving: share((m) => m.moving) >= MOUTH_SPOKE,
-    };
+    return { holder, ...judgeSpeech(samples, span, this.persons.length === 1) };
   }
 
   /** The floor holder, framed head and shoulders (video px) — for anything that
