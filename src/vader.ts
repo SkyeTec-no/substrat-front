@@ -14,7 +14,9 @@ import { settings } from "./openrouter";
 const MODEL = "openai/gpt-audio-mini";
 const VOICE = "onyx";
 const RATE = 24000; // pcm16 sample rate from the API
-const SLOW = 0.8; // playback rate: lower and slower, the Vader cadence
+const SLOW = 0.86; // playback rate: lower formants and a heavier cadence
+const CARRIER_HZ = 82; // the robot's one note (E2) — the vocoder sings everything on it
+const CARRIER_RATIOS = [1, 2.006, 0.5]; // fundamental, a slightly sharp octave, a sub
 const TTS_SYS =
   "You are a text-to-speech engine, not an assistant. The user message contains one text between « and ». " +
   "Read exactly that text aloud in Norwegian bokmål, slowly, with a deep, calm, commanding voice — " +
@@ -197,6 +199,7 @@ export class VaderVoice {
   onContext: (ctx: AudioContext) => void = () => {};
   private input: GainNode | null = null;
   private crushIn: GainNode | null = null; // same chain, but through a bitcrusher first
+  private carrierOscs: OscillatorNode[] = [];
   private room: GainNode | null = null; // reverb send
   /** Fired as a voice glitch plays — the scene glitches with it. */
   onGlitch: (strength: number, ms: number) => void = () => {};
@@ -207,34 +210,116 @@ export class VaderVoice {
   private audio(): AudioContext {
     if (this.ctx) return this.ctx;
     const ctx = new AudioContext();
-    const input = ctx.createGain();
-    const bass = ctx.createBiquadFilter();
-    bass.type = "lowshelf";
-    bass.frequency.value = 180;
-    bass.gain.value = 6;
+    const input = ctx.createGain(); // the spoken voice: the vocoder's modulator
+
+    // --- carrier: what the robot "sings" with — a flat buzz at one pitch, an
+    // octave a hair sharp for metal, and noise for the s/t/k sounds up top
+    const carrier = ctx.createGain();
+    const oscs = [
+      { type: "sawtooth" as OscillatorType, f: CARRIER_HZ * CARRIER_RATIOS[0], g: 0.6 },
+      { type: "sawtooth" as OscillatorType, f: CARRIER_HZ * CARRIER_RATIOS[1], g: 0.3 },
+      { type: "square" as OscillatorType, f: CARRIER_HZ * CARRIER_RATIOS[2], g: 0.15 },
+    ].map(({ type, f, g }) => {
+      const o = ctx.createOscillator();
+      o.type = type;
+      o.frequency.value = f;
+      const og = ctx.createGain();
+      og.gain.value = g;
+      o.connect(og).connect(carrier);
+      o.start();
+      return o;
+    });
+    const hiss = ctx.createBufferSource();
+    const nb = ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate);
+    const nd = nb.getChannelData(0);
+    for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+    hiss.buffer = nb;
+    hiss.loop = true;
+    hiss.start();
+
+    // --- 18-band channel vocoder: each band of the voice opens the same band
+    // of the carrier. Third-octave bands from 120 Hz to 7 kHz.
+    const rect = new Float32Array(1024);
+    for (let i = 0; i < rect.length; i++) rect[i] = Math.abs(i / 512 - 1);
+    const vocoded = ctx.createGain();
+    vocoded.gain.value = 1.8; // make-up: band-limited envelopes are quiet
+    const BANDS = 18;
+    for (let b = 0; b < BANDS; b++) {
+      const f = 120 * Math.pow(7000 / 120, b / (BANDS - 1));
+      const q = 4.3;
+      const mod = ctx.createBiquadFilter();
+      mod.type = "bandpass";
+      mod.frequency.value = f;
+      mod.Q.value = q;
+      const rectifier = ctx.createWaveShaper();
+      rectifier.curve = rect;
+      const env = ctx.createBiquadFilter(); // envelope follower
+      env.type = "lowpass";
+      env.frequency.value = 38;
+      const envGain = ctx.createGain();
+      envGain.gain.value = 9;
+      const vca = ctx.createGain();
+      vca.gain.value = 0;
+      input.connect(mod).connect(rectifier).connect(env).connect(envGain).connect(vca.gain);
+      const car = ctx.createBiquadFilter();
+      car.type = "bandpass";
+      car.frequency.value = f;
+      car.Q.value = q;
+      (f > 3800 ? hiss : carrier).connect(car);
+      car.connect(vca).connect(vocoded);
+    }
+
+    // ring modulation: the voice wobbles at 47 Hz — the metallic, tinny edge
+    const ring = ctx.createGain();
+    ring.gain.value = 0.7;
+    const ringOsc = ctx.createOscillator();
+    ringOsc.frequency.value = 47;
+    const ringDepth = ctx.createGain();
+    ringDepth.gain.value = 0.3;
+    ringOsc.connect(ringDepth).connect(ring.gain);
+    ringOsc.start();
+    vocoded.connect(ring);
+
+    // a thin layer of the real voice underneath keeps the words intelligible
+    const dry = ctx.createBiquadFilter();
+    dry.type = "lowpass";
+    dry.frequency.value = 2400;
+    const dryGain = ctx.createGain();
+    dryGain.gain.value = 0.22;
+    input.connect(dry).connect(dryGain);
+
+    const mix = ctx.createGain();
+    ring.connect(mix);
+    dryGain.connect(mix);
     const shaper = ctx.createWaveShaper();
     const curve = new Float32Array(1024);
-    for (let i = 0; i < curve.length; i++) curve[i] = Math.tanh((i / 512 - 1) * 2.2);
+    for (let i = 0; i < curve.length; i++) curve[i] = Math.tanh((i / 512 - 1) * 1.6);
     shaper.curve = curve;
-    const lp = ctx.createBiquadFilter();
-    lp.type = "lowpass";
-    lp.frequency.value = 2600;
     // the mask: a short feedback comb gives the hollow, metallic resonance
     const comb = ctx.createDelay();
-    comb.delayTime.value = 0.011;
+    comb.delayTime.value = 0.009;
     const fb = ctx.createGain();
-    fb.gain.value = 0.35;
+    fb.gain.value = 0.42;
     comb.connect(fb).connect(comb);
     const out = ctx.createGain();
-    out.gain.value = 0.9;
+    out.gain.value = 0.7;
+    // a limiter last: comb feedback and glitch bursts must never clip the room
+    const limiter = ctx.createDynamicsCompressor();
+    limiter.threshold.value = -8;
+    limiter.knee.value = 4;
+    limiter.ratio.value = 14;
+    limiter.attack.value = 0.002;
+    limiter.release.value = 0.12;
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 512;
-    input.connect(bass).connect(shaper).connect(lp);
-    lp.connect(out);
-    lp.connect(comb);
+    mix.connect(shaper);
+    shaper.connect(out);
+    shaper.connect(comb);
     comb.connect(out);
-    out.connect(analyser);
-    out.connect(ctx.destination);
+    out.connect(limiter);
+    limiter.connect(analyser);
+    limiter.connect(ctx.destination);
+    this.carrierOscs = oscs;
 
     // glitch path: 3-bit-ish staircase before the mask
     const crushIn = ctx.createGain();
@@ -315,6 +400,16 @@ export class VaderVoice {
     o.connect(g).connect(ctx.destination);
     o.start(at);
     o.stop(at + 0.05);
+  }
+
+  /** The robot's note jumps for a moment — the carrier glitches with the voice. */
+  private carrierJump(at: number, dur: number) {
+    const factor = [1.5, 0.75, 2, 1.335][Math.floor(Math.random() * 4)];
+    for (const [i, o] of this.carrierOscs.entries()) {
+      const f = CARRIER_RATIOS[i] * CARRIER_HZ; // from the base, so jumps never drift
+      o.frequency.setValueAtTime(f * factor, at);
+      o.frequency.setValueAtTime(f, at + Math.min(0.25, dur));
+    }
   }
 
   /** Open the audio context inside a user gesture (the Begin click), so idle
@@ -445,9 +540,12 @@ export class VaderVoice {
       }
       glitches--;
       const cut = len * (0.25 + Math.random() * 0.4);
-      const kind = (["stutter", "pitch", "crush"] as const)[Math.floor(Math.random() * 3)];
-      const fire = (at: number, strength: number, ms: number) =>
+      const kinds = ["stutter", "pitch", "crush", "freeze", "tapestop", "reverse"] as const;
+      const kind = kinds[Math.floor(Math.random() * kinds.length)];
+      const fire = (at: number, strength: number, ms: number) => {
+        this.carrierJump(at, ms / 1000);
         window.setTimeout(() => this.onGlitch(strength, ms), Math.max(0, (at - ctx.currentTime) * 1000));
+      };
 
       play(b, next, 0, cut, this.input!);
       let t = next + cut / SLOW;
@@ -468,6 +566,43 @@ export class VaderVoice {
         rest.playbackRate.setValueAtTime(SLOW, t + 0.08);
         fire(t, 0.8, 180);
         t += (len - cut) / SLOW - 0.04; // it ran fast for a moment
+      } else if (kind === "freeze") {
+        // the signal locks on a 25 ms grain and buzzes, dying away
+        const grain = 0.025;
+        fire(t, 0.9, 300);
+        for (let i = 0; i < 9; i++) {
+          const g = ctx.createGain();
+          g.gain.value = 1 - i / 10;
+          g.connect(this.input!);
+          play(b, t, cut, grain, g);
+          t += grain / SLOW;
+        }
+        play(b, t, cut, len - cut, this.input!);
+        t += (len - cut) / SLOW;
+      } else if (kind === "tapestop") {
+        // power failing: the voice sags in pitch and speed, then snaps back
+        const sag = Math.min(0.2, len - cut);
+        const s1 = play(b, t, cut, sag, this.input!);
+        s1.playbackRate.setValueAtTime(SLOW, t);
+        s1.playbackRate.linearRampToValueAtTime(SLOW * 0.3, t + 0.22);
+        fire(t, 0.8, 320);
+        t += 0.26;
+        play(b, t, cut + sag, len - cut - sag, this.input!);
+        t += (len - cut - sag) / SLOW;
+      } else if (kind === "reverse") {
+        // a 120 ms scrap of the word, played backwards
+        const grain = Math.min(0.12, len - cut);
+        const n = Math.floor(grain * RATE);
+        const off = Math.floor(cut * RATE);
+        const rev = ctx.createBuffer(1, n, RATE);
+        const src = b.getChannelData(0);
+        const dst = rev.getChannelData(0);
+        for (let i = 0; i < n; i++) dst[i] = src[off + n - 1 - i] ?? 0;
+        fire(t, 0.7, 200);
+        play(rev, t, 0, grain, this.input!);
+        t += grain / SLOW;
+        play(b, t, cut + grain, len - cut - grain, this.input!);
+        t += (len - cut - grain) / SLOW;
       } else {
         // a crushed burst through the low-bit path
         const burst = Math.min(0.18, len - cut);
