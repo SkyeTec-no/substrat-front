@@ -15,6 +15,7 @@ import { loadImage, svgToCanvas, createTableRenderer, createWipeRenderer, create
 import { GestureControl, captureCameraFrame, type HandState, type MeetingState } from "./gestures";
 import { theme, setDarkMode, initTheme, onThemeChange } from "./theme";
 import { renderParticipants, type ParticipantView } from "./participants";
+import { VoiceBook } from "./voices";
 import { jevSettings, jevLog, jevLogCsv, checkAddressee, type JevMode } from "./jev";
 
 const canvas = document.querySelector<HTMLCanvasElement>("#scene")!;
@@ -554,16 +555,44 @@ async function converse() {
 
   // in a meeting: only act on speech when the floor holder's lips were moving
   const mouth = settings.handGestures ? gestures?.holderSpokeSince(listenSince) : null;
+
+  // the voice has the last word when Octa knows it: the holder's own voice
+  // passes even if their lips were hidden; another known voice is turned away
+  const holderId = mouth?.holder ?? floorHolder;
+  let voiceSays: "holder" | "other" | null = null;
+  let voiceNote = "";
+  if (voices && holderId !== null && voices.known(holderId) > 0 && settings.handGestures) {
+    const v = await voices.identify(listenSince - 600);
+    if (myTurn !== turnId) return;
+    if (v) {
+      const hs = v.scores.get(holderId) ?? -1;
+      if (v.id === holderId) voiceSays = "holder";
+      else if (v.id !== null && v.score - hs > 0.08) voiceSays = "other";
+      voiceNote = ` · voice ${v.id !== null ? `P${v.id}` : "?"} ${v.score.toFixed(2)}`;
+      console.info(`[voice] heard ${v.id !== null ? `P${v.id}` : "unknown"} (${v.score.toFixed(2)}), holder P${holderId} ${hs.toFixed(2)}`);
+    }
+  }
+  const accepted = voiceSays === "holder" || (voiceSays !== "other" && (!mouth || mouth.spoke));
   mouthVerdict = {
-    text: !mouth
-      ? "heard · lips not checked"
-      : mouth.spoke
-        ? `heard P${mouth.holder} ✓`
-        : `dropped · P${mouth.holder} lips ${mouth.movingMs}ms`,
-    ok: !mouth || mouth.spoke,
+    text:
+      (accepted
+        ? holderId !== null ? `heard P${holderId} ✓` : "heard"
+        : mouth ? `dropped · P${mouth.holder} lips ${mouth.movingMs}ms` : "dropped") + voiceNote,
+    ok: accepted,
     at: performance.now(),
   };
-  if (mouth && !mouth.spoke) {
+  if (!accepted && voiceSays === "other" && holderId !== null) {
+    setState("speaking");
+    const msg = `Det hørtes ut som en annen stemme, men P${holderId} har ordet.`;
+    showTranscript(msg);
+    await speaker.speak(msg, () => {
+      scene.pulse(1);
+      speakLevel = 0.5;
+    });
+    if (myTurn === turnId) setState("idle");
+    return;
+  }
+  if (!accepted && mouth && !mouth.spoke) {
     console.info(
       `[floor] dropped "${heard}" — P${mouth.holder}: lips ${mouth.movingMs}ms, to Octa ${mouth.toOctaMs}ms, alone ${mouth.alone}`
     );
@@ -994,8 +1023,12 @@ function drawCamView() {
     camCtx.lineWidth = p.id === snap.holder ? 3 : 1.5;
     camCtx.strokeRect(mx(p.x + p.w), p.y * k, p.w * k, p.h * k);
     camCtx.fillStyle = tint(p.id);
+    const heardVoice = voices?.known(p.id) ?? 0;
     const tags =
-      (p.id === snap.holder ? " ●" : "") + (p.looking ? " looking" : "") + (p.talking ? " speaking" : "");
+      (p.id === snap.holder ? " ●" : "") +
+      (p.looking ? " looking" : "") +
+      (p.talking ? " speaking" : "") +
+      (heardVoice ? ` voice×${heardVoice}` : "");
     camCtx.fillText(`P${p.id}${tags}`, mx(p.x + p.w), p.y * k - 4);
   }
   for (const hd of snap.hands) {
@@ -1095,6 +1128,7 @@ startBtn.addEventListener("click", async () => {
 
   try {
     await mic.init(deviceSettings.micId);
+    voices ??= new VoiceBook(mic);
   } catch {
     showTranscript("mikrofonen er utilgjengelig — bare visuelt");
   }
@@ -1234,6 +1268,7 @@ function renderMeeting(m: MeetingState) {
 
 let gestures: GestureControl | null = null;
 let floorHolder: number | null = null;
+let voices: VoiceBook | null = null; // who's speaking, by voice (learned from the camera)
 let meetingPersons = 0;
 
 // One mediator for highlight focus: hand hover beats mouse hover.
@@ -1436,7 +1471,19 @@ function frame() {
   }
   if (now - participantsAt > 100) {
     participantsAt = now;
-    const view = participantsPreview ?? (gestures && settings.handGestures ? gestures.snapshot() : null);
+    let view = participantsPreview ?? (gestures && settings.handGestures ? gestures.snapshot() : null);
+    if (view && voices && !participantsPreview) {
+      // teach the voice book from unambiguous moments, and let a recognized
+      // voice light up its speaker's tile even when their lips aren't visible
+      const level = mic.level();
+      voices.observe(view.persons.filter((p) => p.talking).map((p) => p.id), level);
+      voices.tickLive(level);
+      const live = voices.live.id !== null && now - voices.live.at < 2000 ? voices.live.id : null;
+      view = {
+        ...view,
+        persons: view.persons.map((p) => ({ ...p, talking: p.talking || p.id === live, voiceKnown: voices!.known(p.id) > 0 })),
+      };
+    }
     const paintFaces = now - facesAt >= 250;
     if (paintFaces) facesAt = now;
     renderParticipants(

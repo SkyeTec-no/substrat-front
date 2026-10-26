@@ -10,7 +10,7 @@ export interface ParticipantView {
   /** Octa is listening right now (to the holder). */
   listening?: boolean;
   queue: number[];
-  persons: { id: number; looking: boolean; talking: boolean; handUp: boolean }[];
+  persons: { id: number; looking: boolean; talking: boolean; handUp: boolean; voiceKnown?: boolean }[];
 }
 
 // 24×24 stroke paths, same line language as the slide icons
@@ -66,6 +66,7 @@ export function renderParticipants(
     const queuePos = view!.queue.indexOf(p.id);
     el.classList.toggle("looking", p.looking);
     el.classList.toggle("talking", p.talking);
+    el.classList.toggle("voice-known", !!p.voiceKnown);
     el.classList.toggle("hand-up", p.handUp);
     el.classList.toggle("holder", holder);
     el.classList.toggle("queued", queuePos >= 0);

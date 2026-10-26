@@ -42,3 +42,4 @@ three.js · GSAP · Web Speech API · Web Audio API · OpenRouter · MediaPipe T
 
 - `public/mediapipe-wasm/` and `public/models/` are the MediaPipe runtime and models (gesture recognizer, face landmarker), served locally rather than from a CDN so gesture tracking works offline and never phones home.
 - Gesture control and the "look at me" / ambient-compliment features require camera permission and are opt-in via the settings panel.
+- `public/models/voxceleb_resnet34_LM.onnx` is [WeSpeaker](https://github.com/wenet-e2e/wespeaker)'s ResNet34 speaker-embedding model trained on VoxCeleb ([Wespeaker/wespeaker-voxceleb-resnet34-LM](https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34-LM), CC BY 4.0). Octa runs it in the browser via ONNX Runtime Web (`public/ort/`) to recognize who is speaking; voiceprints are learned from moments when the camera sees a person's lips move, kept in memory for the session only, and never leave the machine.

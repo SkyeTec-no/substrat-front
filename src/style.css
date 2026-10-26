@@ -488,6 +488,9 @@ body {
   transition: background 0.2s;
 }
 
+/* Octa has learned this person's voice: the meter bars sit solid, not faint */
+.pt.voice-known .pt-meter i { background: color-mix(in srgb, var(--who) 55%, transparent); }
+
 .pt.talking .pt-meter i {
   background: var(--who);
   animation: pt-talk 0.45s ease-in-out infinite alternate;
