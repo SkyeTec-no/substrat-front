@@ -63,7 +63,8 @@ export const DARK: ThemeTokens = {
 };
 
 let current: ThemeTokens =
-  localStorage.getItem("octa-dark") === "1" ? DARK : LIGHT;
+  // dark by default; light only when someone chose it
+  localStorage.getItem("octa-dark") === "0" ? LIGHT : DARK;
 
 const listeners: ((t: ThemeTokens) => void)[] = [];
 
