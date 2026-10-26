@@ -186,7 +186,8 @@ export class CloudRecognizer implements SpeechCapture {
       this.onEnd();
     };
 
-    // a simple level VAD: speech → wait for 0.8 s of quiet; nothing for 4 s → give up
+    // a simple level VAD: speech → wait for 1.4 s of quiet (room for a thinking
+    // pause mid-question); nothing for 5 s → give up
     const vad = window.setInterval(() => {
       const now = performance.now();
       const loud = mic.level() > 0.12;
@@ -196,8 +197,8 @@ export class CloudRecognizer implements SpeechCapture {
       }
       if (
         this.stopNow ||
-        (heard && now - lastLoud > 800) ||
-        (!heard && now - started > 4000) ||
+        (heard && now - lastLoud > 1400) ||
+        (!heard && now - started > 5000) ||
         now - started > 20000
       ) {
         void done();

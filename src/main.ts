@@ -531,6 +531,7 @@ async function converse(opts: { wakeOnly?: boolean; candidate?: number; given?: 
   sound?.ensureRunning();
 
   if (state === "listening") {
+    if (call) finishCall(true); // second press: they're done talking
     activeRec?.stop(); // second press: finish the capture now
     return;
   }
@@ -1213,11 +1214,12 @@ startBtn.addEventListener("click", async () => {
     await mic.init(deviceSettings.micId);
     voices ??= new VoiceBook(mic);
     if (!meeting) {
-      meeting = new MeetingLog(mic, voices, () => speaker.speaking || state === "listening" || noteMode);
+      meeting = new MeetingLog(mic, voices, () => speaker.speaking || (state === "listening" && !call) || noteMode);
       // "Okta" anywhere in the room: collected for a beat, so several people
       // calling at once can be told to take turns
       meeting.onLine = (line) => {
-        if (addressesOcta(line.text)) heardCall(line);
+        if (call) followCall(line);
+        else if (addressesOcta(line.text)) heardCall(line);
       };
     }
     meeting.enabled = settings.meetingLog;
@@ -1369,6 +1371,7 @@ let meeting: MeetingLog | null = null; // minutes of everything said in the room
 
 let calls: LogLine[] = [];
 let callTimer = 0;
+let callPoll = 0;
 
 function heardCall(line: LogLine) {
   calls.push(line);
@@ -1408,14 +1411,50 @@ async function answerCall() {
     });
     setState("idle");
   }
-  // "Okta, hva tenker du om det?" — answer it; a bare "Okta!" — listen
-  const rest = pick.text.replace(/(?<!\p{L})(okta|octa|åkta|okka|oktan)(?!\p{L})[\s,.!?:]*/giu, " ").trim();
-  if (!crowd && rest.split(/\s+/).filter(Boolean).length >= 2) {
-    converse({ given: { text: pick.text, who: id } });
-  } else {
-    sound?.ping(1568, 0.07);
-    converse();
+  // Octa listens to the caller until they're done: the room mic keeps
+  // running, and every line from them is added on until they've gone quiet.
+  // In a crowd, what they said before Octa sorted the room doesn't count.
+  call = { who: pick.who, id, text: crowd ? "" : pick.text, last: performance.now(), since: performance.now() };
+  setState("listening");
+  if (call.text) showTranscript(stripName(call.text), true);
+  callPoll = window.setInterval(() => finishCall(false), 100);
+}
+
+/** The open call: who called Octa, and everything they've said since. */
+let call: { who: string; id: number | null; text: string; last: number; since: number } | null = null;
+const CALL_QUIET_MS = 1500; // this much quiet after the last word = they're done
+const CALL_WAIT_MS = 6000; // a bare "Okta" and then nothing: give up
+
+function stripName(text: string): string {
+  return text.replace(/(?<!\p{L})(okta|octa|åkta|okka|oktan)(?!\p{L})[\s,.!?:]*/giu, " ").trim();
+}
+
+function followCall(line: LogLine) {
+  if (!call) return;
+  // the caller, or a line nobody could place — not someone else chatting
+  if (line.who !== call.who && line.who !== "?" && call.who !== "?") return;
+  call.text = `${call.text} ${line.text}`.trim();
+  call.last = performance.now();
+  showTranscript(stripName(call.text), true);
+}
+
+function finishCall(now: boolean) {
+  if (!call) return;
+  const words = stripName(call.text).split(/\s+/).filter(Boolean).length;
+  const quiet = Math.min(performance.now() - call.last, meeting?.quietFor() ?? Infinity);
+  if (!now) {
+    if (meeting?.busy) return; // still talking, or the last words are being transcribed
+    if (words < 2 ? performance.now() - call.since < CALL_WAIT_MS : quiet < CALL_QUIET_MS) return;
   }
+  window.clearInterval(callPoll);
+  callPoll = 0;
+  const done = call;
+  call = null;
+  setState("idle");
+  if (!words) return;
+  // the name may have gone with the crowd warning; the call was by name all the same
+  const text = addressesOcta(done.text) ? done.text : `Okta, ${done.text}`;
+  converse({ given: { text, who: done.id } });
 }
 let meetingPersons = 0;
 
@@ -1563,7 +1602,7 @@ Object.assign(window, {
     scene, agentEvents, setState, presentArtifacts, salvageVisualFromText, visualsEl,
     jevLog, jevLogCsv, checkAddressee, converse, setTier,
     // for scripted runs: patch Recognizer.prototype / speaker to feed text in
-    Recognizer, speaker, idleGlitch, heardCall,
+    Recognizer, speaker, idleGlitch, heardCall, followCall,
     previewParticipants: (v: ParticipantView | null) => (participantsPreview = v),
     get gestures() { return gestures; },
     get state() { return state; },

@@ -45,6 +45,8 @@ export class MeetingLog {
   private voices: VoiceBook | null;
   private paused: () => boolean;
   private summarizing = false;
+  private inflight = 0; // utterances still being transcribed
+  private lastLoud = 0;
   /** Every transcribed room line, as it lands (the app listens for "Okta"). */
   onLine: (line: LogLine) => void = () => {};
 
@@ -64,10 +66,21 @@ export class MeetingLog {
     while (this.talkers.length && t - this.talkers[0].t > 30_000) this.talkers.shift();
   }
 
+  /** Someone is mid-utterance, or what they said hasn't landed as a line yet. */
+  get busy(): boolean {
+    return !!this.seg || this.inflight > 0;
+  }
+
+  /** ms since the room mic last heard speech. */
+  quietFor(): number {
+    return performance.now() - this.lastLoud;
+  }
+
   /** ~10×/s: the VAD. Pauses while Octa talks or takes a command itself. */
   tick(level: number) {
     if (!this.enabled && !this.wake) return;
     const now = performance.now();
+    if (level >= START_LEVEL) this.lastLoud = now;
     if (this.paused()) {
       this.seg = null; // Octa's own voice and its command captures aren't room talk
       return;
@@ -112,6 +125,7 @@ export class MeetingLog {
 
   private async finish(blocks: Float32Array[], t0: number, t1: number) {
     const rate = this.mic.sampleRate;
+    this.inflight++;
     try {
       const [text, voice] = await Promise.all([
         transcribe(toWavBase64(blocks, rate)),
@@ -139,6 +153,8 @@ export class MeetingLog {
       void this.maybeSummarize();
     } catch (err) {
       console.warn("meeting transcription failed", err);
+    } finally {
+      this.inflight--;
     }
   }
 
