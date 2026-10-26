@@ -59,6 +59,8 @@ export interface GestureEvents {
   onMeeting?: (s: MeetingState) => void;
   /** The floor holder started talking while facing Octa — time to listen. */
   onHolderTalk?: (person: number) => void;
+  /** With the floor free, someone faces Octa and starts talking. */
+  onFreeTalk?: (person: number) => void;
   /** A number was given to someone Octa can't tie to anyone it saw before. */
   onNewPerson?: (person: number) => void;
 }
@@ -118,6 +120,9 @@ interface Person {
   /** A still of their face, taken the moment they faced the camera — kept for the tile. */
   portrait: HTMLCanvasElement | null;
   portraitAt: number;
+  /** Where the face mesh last found their face (video px) — the strongest
+   *  evidence of who is who: two tracks reading one face are one person. */
+  faceBox: { x0: number; y0: number; x1: number; y1: number } | null;
   /** Lip gap / face height per face frame, with whether the lips were moving
    *  and the face was turned to Octa then. */
   mouth: { t: number; gap: number; moving: boolean; looking: boolean }[];
@@ -451,6 +456,11 @@ export class GestureControl {
     return { person: holder, crop: { x, y, w, h } };
   }
 
+  /** Give the free floor to this person (they addressed Octa by name). */
+  giveFloor(id: number) {
+    this.floor?.give(id);
+  }
+
   /** Clear the floor and the queue — whoever raises a hand next takes it. */
   resetFloor() {
     this.floor?.reset();
@@ -533,7 +543,8 @@ export class GestureControl {
           q !== p &&
           q.id < p.id &&
           (Math.hypot(q.cx - p.cx, q.cy - p.cy) < Math.max(q.w, p.w) * 0.8 ||
-            this.sameBody(q, p.box, { x: p.cx, y: p.cy }))
+            this.sameBody(q, p.box, { x: p.cx, y: p.cy }) ||
+            this.sameFace(q, p, now))
       );
       if (twin) {
         twin.portrait ??= p.portrait;
@@ -687,7 +698,7 @@ export class GestureControl {
       best = {
         id, cx, cy, w, h, top: 0, ears, wrists, lastSeen: now,
         poseFacing, faceAt: 0, raiseSince: 0, raiseFired: false,
-        portrait: ghost?.portrait ?? null, portraitAt: ghost?.portraitAt ?? 0,
+        portrait: ghost?.portrait ?? null, portraitAt: ghost?.portraitAt ?? 0, faceBox: null,
         box: box ?? { x0: cx - w, y0: cy + h * 0.6, x1: cx + w, y1: cy + h * 2.5 },
         arms,
         mouth: [], lookEma: 0, looking: false,
@@ -714,6 +725,17 @@ export class GestureControl {
         this.floor?.raise(best.id);
       }
     }
+  }
+
+  /** Both tracks recently read a face, and it's the same face in the frame. */
+  private sameFace(a: Person, b: Person, now: number): boolean {
+    if (!a.faceBox || !b.faceBox || now - a.faceAt > 1500 || now - b.faceAt > 1500) return false;
+    const A = a.faceBox, B = b.faceBox;
+    const ix = Math.max(0, Math.min(A.x1, B.x1) - Math.max(A.x0, B.x0));
+    const iy = Math.max(0, Math.min(A.y1, B.y1) - Math.max(A.y0, B.y0));
+    const inter = ix * iy;
+    const union = (A.x1 - A.x0) * (A.y1 - A.y0) + (B.x1 - B.x0) * (B.y1 - B.y0) - inter;
+    return union > 0 && inter / union > 0.3;
   }
 
   /** Big next to a tile — i.e. close to the camera. */
@@ -782,6 +804,20 @@ export class GestureControl {
     const lm = this.faceLandmarker!.detect(this.crop!).faceLandmarks[0];
     if (!lm) return; // too small or turned away — pose keeps the gaze estimate
     p.faceAt = now;
+    // the mesh knows exactly where the face is: record it, and pull the track
+    // onto it (the pose's head guess drifts, and two drifting guesses on one
+    // head were how duplicates were born)
+    let fx0 = Infinity, fy0 = Infinity, fx1 = -Infinity, fy1 = -Infinity;
+    for (const l of lm) {
+      fx0 = Math.min(fx0, l.x); fx1 = Math.max(fx1, l.x);
+      fy0 = Math.min(fy0, l.y); fy1 = Math.max(fy1, l.y);
+    }
+    p.faceBox = { x0: sx + fx0 * side, y0: sy + fy0 * side, x1: sx + fx1 * side, y1: sy + fy1 * side };
+    const fw = p.faceBox.x1 - p.faceBox.x0;
+    p.cx += ((p.faceBox.x0 + p.faceBox.x1) / 2 - p.cx) * 0.5;
+    p.cy += ((p.faceBox.y0 + p.faceBox.y1) / 2 - p.cy) * 0.5;
+    p.w += (fw * 1.15 - p.w) * 0.5;
+    p.h = p.w * 1.3;
     // inner-lip gap (13 upper, 14 lower) over forehead-to-chin (10, 152); the
     // crop is square, so normalized coordinates keep their proportions
     const faceH = Math.hypot(lm[10].x - lm[152].x, lm[10].y - lm[152].y) || 1;
@@ -1024,16 +1060,22 @@ export class GestureControl {
       now
     );
 
-    // talk-to-listen: the holder faces Octa and their lips move for a beat
-    const last = holderPerson?.mouth.at(-1);
-    const talkingToOcta = !!holderPerson && holderPerson.looking && !!last?.moving && now - last.t < 200;
+    // talk-to-listen: the holder faces Octa and their lips move for a beat —
+    // or, with the floor free, anyone does (Octa then answers only if it's
+    // addressed by name)
+    const lipsNow = (p: Person) => !!p.mouth.at(-1)?.moving && now - (p.mouth.at(-1)?.t ?? 0) < 200;
+    const talker =
+      holderPerson ?? (this.floor?.holder == null ? this.persons.find((p) => p.looking && lipsNow(p)) : undefined);
+    const last = talker?.mouth.at(-1);
+    const talkingToOcta = !!talker && talker.looking && lipsNow(talker);
     if (talkingToOcta) {
       if (!this.talkSince) this.talkSince = now;
       if (!this.talkFired && now - this.talkSince > 250) {
         this.talkFired = true;
-        events.onHolderTalk?.(holderPerson!.id);
+        if (holderPerson) events.onHolderTalk?.(talker!.id);
+        else events.onFreeTalk?.(talker!.id);
       }
-    } else if (now - (last?.t ?? 0) > 1500 || !holderPerson?.looking) {
+    } else if (now - (last?.t ?? 0) > 1500 || !talker?.looking) {
       // a pause or a look away re-arms it for the next thing they say
       this.talkSince = 0;
       this.talkFired = false;

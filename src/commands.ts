@@ -13,6 +13,12 @@ export function isRecallCommand(text: string): boolean {
   );
 }
 
+/** Spoken to Octa by name ("Okta, …", "hva tenker du, Octa?"). The STT
+ *  writes the name many ways; \b doesn't see "å", so use letter lookarounds. */
+export function addressesOcta(text: string): boolean {
+  return /(?<!\p{L})(okta|octa|åkta|okka|oktan)(?!\p{L})/iu.test(text);
+}
+
 /** "this / that" — the command means whatever is being pointed at. */
 export function isDeictic(text: string): boolean {
   return /\b(denne|dette|den her|det her|this|that one|this one)\b/i.test(text);

@@ -558,8 +558,24 @@ async function lookAtUser(
 export async function respond(
   transcript: string,
   events: AgentEvents,
-  ctx: { lastImage?: string; captureFrame?: () => Promise<string | null> } = {}
+  ctx: { lastImage?: string; captureFrame?: () => Promise<string | null>; meeting?: string } = {}
 ): Promise<ChatResult> {
+  // the meeting so far, when Octa is keeping minutes — "det", "det hun sa",
+  // "hva tenker du om det?" all point into it
+  const meeting: ORMessage[] = ctx.meeting
+    ? [
+        {
+          role: "system",
+          content:
+            "You are in a meeting and have been following everything said in the room (P1, P2 … are people, " +
+            "numbered by the camera). The transcript below is newer than the chat history above. If the request " +
+            "points at something said in the room — 'det', 'det hun/han " +
+            "sa', 'hva tenker du om det', 'enig?' — it means the latest relevant lines below: answer about that, " +
+            "and name who said it when useful. For 'oppsummer møtet' or 'hva har vi bestemt', use all of it.\n\n" +
+            ctx.meeting,
+        },
+      ]
+    : [];
   const history = loadHistory();
 
   if (!settings.agentsEnabled) {
@@ -602,6 +618,9 @@ export async function respond(
         ` ${today()}`,
     },
     ...history,
+    // the room comes last, right before the question: "det" means what was
+    // just said in the meeting, not an older exchange with Octa
+    ...meeting,
     { role: "user", content: transcript },
   ], settings.model, { json: true });
 
@@ -706,6 +725,7 @@ export async function respond(
   const synth = await chat([
     { role: "system", content: SYNTH_SYS },
     ...history,
+    ...meeting,
     {
       role: "user",
       content:

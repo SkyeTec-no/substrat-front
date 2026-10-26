@@ -9,13 +9,14 @@ import { respond, keynote, repairMermaid, generateReport, generateCompliments, g
 import { remember, clearHistory } from "./history";
 import { renderMermaidSvg } from "./visuals";
 import { isDownloadCommand, downloadArtifacts } from "./download";
-import { tierCommand, isDeictic, zoomCommand, findPanel, isRecallCommand, isDismissCommand, isDismissAll, isOpenCommand, isShelveCommand, isNoteCommand, isStopNotesCommand, isReportCommand } from "./commands";
+import { tierCommand, addressesOcta, isDeictic, zoomCommand, findPanel, isRecallCommand, isDismissCommand, isDismissAll, isOpenCommand, isShelveCommand, isNoteCommand, isStopNotesCommand, isReportCommand } from "./commands";
 import { buildReportPdf, type ReportArtifact } from "./report";
 import { loadImage, svgToCanvas, createTableRenderer, createWipeRenderer, createSlideRenderer, noteToCanvas } from "./panels";
 import { GestureControl, captureCameraFrame, type HandState, type MeetingState } from "./gestures";
 import { theme, setDarkMode, initTheme, onThemeChange } from "./theme";
 import { renderParticipants, type ParticipantView } from "./participants";
 import { VoiceBook } from "./voices";
+import { MeetingLog } from "./meeting";
 import { jevSettings, jevLog, jevLogCsv, checkAddressee, type JevMode } from "./jev";
 
 const canvas = document.querySelector<HTMLCanvasElement>("#scene")!;
@@ -359,6 +360,7 @@ async function reply(heard: string, events: typeof agentEvents): Promise<ChatRes
   const result = await respond(heard, events, {
     lastImage: lastResult?.images[0],
     captureFrame: () => captureCameraFrame(gestures),
+    meeting: meeting?.enabled ? meeting.context() : undefined,
   });
   return keynote(result);
 }
@@ -518,7 +520,13 @@ function resolvePanel(heard: string, opts: { fallback: "focused" | "latest" | "n
   return null;
 }
 
-async function converse() {
+/**
+ * One turn: listen, decide, answer.
+ * - wakeOnly: someone faced Octa with the floor free — only act if they
+ *   addressed it by name ("Okta, …"), and then give them the floor.
+ * - given: the words were already heard (a "Okta, …" line from the minutes).
+ */
+async function converse(opts: { wakeOnly?: boolean; candidate?: number; given?: { text: string; who: number | null } } = {}) {
   if (noteMode) return; // the scribe owns the microphone
   sound?.ensureRunning();
 
@@ -535,17 +543,34 @@ async function converse() {
   showTranscript("");
   // artifacts stay on screen while listening — "download it" needs them
 
-  const rec = createRecognizer();
-  activeRec = rec;
   const listenSince = performance.now();
-  const heard = await new Promise<string | null>((resolve) => {
-    rec.onInterim = (t) => showTranscript(t, true);
-    rec.onFinal = (t) => resolve(t);
-    rec.onEnd = () => resolve(null);
-    rec.start();
-  });
-  activeRec = null;
+  let heard: string | null;
+  if (opts.given) {
+    heard = opts.given.text;
+  } else {
+    const rec = createRecognizer();
+    activeRec = rec;
+    heard = await new Promise<string | null>((resolve) => {
+      rec.onInterim = (t) => showTranscript(t, true);
+      rec.onFinal = (t) => resolve(t);
+      rec.onEnd = () => resolve(null);
+      rec.start();
+    });
+    activeRec = null;
+  }
   if (myTurn !== turnId) return;
+
+  // addressed by name with the floor free: answer them, and they have the floor
+  if (heard && (opts.wakeOnly || opts.given)) {
+    const who = opts.given?.who ?? opts.candidate ?? null;
+    if (!addressesOcta(heard) || (floorHolder !== null && floorHolder !== who)) {
+      // talk in the room, not to Octa — say nothing
+      setState("idle");
+      showTranscript("");
+      return;
+    }
+    if (who !== null && floorHolder === null) gestures?.giveFloor(who);
+  }
 
   if (!heard) {
     setState("idle");
@@ -554,14 +579,15 @@ async function converse() {
   }
 
   // in a meeting: only act on speech when the floor holder's lips were moving
-  const mouth = settings.handGestures ? gestures?.holderSpokeSince(listenSince) : null;
+  // words that came from the minutes were attributed there — no lip/voice gate
+  const mouth = settings.handGestures && !opts.given ? gestures?.holderSpokeSince(listenSince) : null;
 
   // the voice has the last word when Octa knows it: the holder's own voice
   // passes even if their lips were hidden; another known voice is turned away
   const holderId = mouth?.holder ?? floorHolder;
   let voiceSays: "holder" | "other" | null = null;
   let voiceNote = "";
-  if (voices && holderId !== null && voices.known(holderId) > 0 && settings.handGestures) {
+  if (voices && holderId !== null && voices.known(holderId) > 0 && settings.handGestures && !opts.given) {
     const v = await voices.identify(listenSince - 600);
     if (myTurn !== turnId) return;
     if (v) {
@@ -637,6 +663,7 @@ async function converse() {
     }
   }
   showTranscript(heard);
+  meeting?.add({ who: holderId !== null ? `P${holderId}` : "?", text: heard, toOcta: true });
 
   // panel + download commands are handled locally — no model round-trip
   const localReply = async (msg: string) => {
@@ -648,6 +675,23 @@ async function converse() {
     });
     if (myTurn === turnId) setState("idle");
   };
+
+  // "vis referatet": the meeting so far as a note card
+  if (/\b(vis|hent\s+fr[ae]m|ta\s+fr[ae]m)\b.{0,20}referat|\bshow( me)? the (minutes|transcript)\b/i.test(heard)) {
+    if (!meeting?.enabled || (!meeting.lines.length && !meeting.summary)) {
+      await localReply("Jeg fører ikke referat. Slå det på i innstillingene.");
+      return;
+    }
+    const rows = meeting.lines.slice(-14).map((l) => `${l.who}${l.toOcta ? " → Octa" : ""}: ${l.text}`);
+    const canvas = noteToCanvas(meeting.summary ? [meeting.summary, ...rows] : rows, "Referat");
+    const id = `panel-${Date.now()}-note`;
+    scene.shelvePanels();
+    scene.addPanel(id, canvas, `referat møtereferat ${rows.join(" ").slice(0, 120)}`);
+    panelArtifacts.set(id, { kind: "note", desc: "referat", source: canvas, noteLines: rows, noteTitle: "Referat" });
+    await localReply("Her er referatet så langt.");
+    return;
+  }
+
 
   // "bruk en smartere modell" — switch brains locally, no model round-trip;
   // anything said beyond the command is then answered by the new brain
@@ -893,6 +937,7 @@ async function converse() {
   setState("speaking");
   showTranscript(result.text);
   await presentArtifacts(result, heard);
+  meeting?.add({ who: "Octa", text: result.text });
   await speaker.speak(speakable(result.text), () => {
     scene.pulse(0.8 + Math.random() * 0.5);
     speakLevel = 0.45 + Math.random() * 0.35;
@@ -972,6 +1017,20 @@ darkCheck.checked = theme().dark;
 darkCheck.addEventListener("change", () => setDarkMode(darkCheck.checked));
 
 // --- camera view: what the gesture camera sees, with faces and hands marked --
+
+// --- minutes: opt-in, and always visible on screen while running ------------
+
+const meetingCheck = document.querySelector<HTMLInputElement>("#or-meeting-log")!;
+const recEl = document.querySelector<HTMLDivElement>("#rec")!;
+function renderRec() {
+  recEl.classList.toggle("visible", !!meeting?.enabled);
+}
+meetingCheck.checked = settings.meetingLog;
+meetingCheck.addEventListener("change", () => {
+  settings.meetingLog = meetingCheck.checked;
+  if (meeting) meeting.enabled = meetingCheck.checked;
+  renderRec();
+});
 
 const autoListenCheck = document.querySelector<HTMLInputElement>("#or-auto-listen")!;
 autoListenCheck.checked = settings.autoListen;
@@ -1129,6 +1188,20 @@ startBtn.addEventListener("click", async () => {
   try {
     await mic.init(deviceSettings.micId);
     voices ??= new VoiceBook(mic);
+    if (!meeting) {
+      meeting = new MeetingLog(mic, voices, () => speaker.speaking || state === "listening" || noteMode);
+      // "Okta, …" heard in the room while nobody holds the floor (or by the
+      // holder): treat it as a request, from that person
+      meeting.onLine = (line) => {
+        if (!addressesOcta(line.text) || state !== "idle" || speaker.speaking) return;
+        const m = /^P(\d+)$/.exec(line.who);
+        const id = m ? Number(m[1]) : null;
+        if (floorHolder !== null && floorHolder !== id) return;
+        converse({ given: { text: line.text, who: id } });
+      };
+    }
+    meeting.enabled = settings.meetingLog;
+    renderRec();
   } catch {
     showTranscript("mikrofonen er utilgjengelig — bare visuelt");
   }
@@ -1269,6 +1342,7 @@ function renderMeeting(m: MeetingState) {
 let gestures: GestureControl | null = null;
 let floorHolder: number | null = null;
 let voices: VoiceBook | null = null; // who's speaking, by voice (learned from the camera)
+let meeting: MeetingLog | null = null; // minutes of everything said in the room (opt-in)
 let meetingPersons = 0;
 
 // One mediator for highlight focus: hand hover beats mouse hover.
@@ -1322,6 +1396,13 @@ async function enableHandGestures() {
         claimHighlight("hand", hover);
       },
       onNewPerson: (id) => voices?.forget(id),
+      onFreeTalk: (id) => {
+        // nobody has the floor and someone faces Octa and talks: listen, but
+        // only answer if they say "Okta"
+        if (!settings.handGestures || !settings.autoListen) return;
+        if (state !== "idle" || speaker.speaking || noteMode) return;
+        converse({ wakeOnly: true, candidate: id });
+      },
       onHolderTalk: () => {
         // talk-to-listen: the floor holder faces Octa and starts speaking
         if (!settings.handGestures || !settings.autoListen) return;
@@ -1465,6 +1546,8 @@ function frame() {
     idleGlitchAt = now + 25000 + Math.random() * 45000;
     idleGlitch();
   }
+  // minutes: the room VAD runs whether or not the camera is on
+  if (meeting?.enabled) meeting.tick(mic.level());
   // the respirator keeps going while Octa thinks
   if (state === "thinking" && settings.voiceStyle === "vader" && !speaker.speaking && now - breathAt > 4800) {
     breathAt = now;
@@ -1477,7 +1560,9 @@ function frame() {
       // teach the voice book from unambiguous moments, and let a recognized
       // voice light up its speaker's tile even when their lips aren't visible
       const level = mic.level();
-      voices.observe(view.persons.filter((p) => p.talking).map((p) => p.id), level);
+      const talkingIds = view.persons.filter((p) => p.talking).map((p) => p.id);
+      voices.observe(talkingIds, level);
+      meeting?.noteTalkers(talkingIds);
       voices.tickLive(level);
       const live = voices.live.id !== null && now - voices.live.at < 2000 ? voices.live.id : null;
       view = {

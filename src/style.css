@@ -543,6 +543,38 @@ body {
   50% { background: color-mix(in srgb, var(--who) 34%, color-mix(in srgb, var(--panel) 80%, transparent)); }
 }
 
+/* minutes are running: a plain, unmissable red mark — everyone in the room
+   should know Octa is transcribing */
+#rec {
+  position: fixed;
+  top: 1.35rem;
+  right: 4.4rem;
+  z-index: 5;
+  display: none;
+  align-items: center;
+  gap: 0.45rem;
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 0.62rem;
+  letter-spacing: 0.25em;
+  text-transform: uppercase;
+  color: var(--signal);
+  pointer-events: none;
+}
+
+#rec.visible { display: flex; }
+
+#rec::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  background: var(--signal);
+  animation: rec-blink 1.6s steps(2, start) infinite;
+}
+
+@keyframes rec-blink {
+  to { visibility: hidden; }
+}
+
 #meeting {
   position: fixed;
   top: 1.35rem;

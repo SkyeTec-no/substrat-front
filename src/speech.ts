@@ -93,7 +93,7 @@ export class MicMeter {
 }
 
 /** Mono float PCM → 16 kHz 16-bit WAV, base64. */
-function toWavBase64(blocks: Float32Array[], inRate: number): string {
+export function toWavBase64(blocks: Float32Array[], inRate: number): string {
   const total = blocks.reduce((n, b) => n + b.length, 0);
   const outRate = 16000;
   const ratio = inRate / outRate;
@@ -210,7 +210,7 @@ export class CloudRecognizer implements SpeechCapture {
   }
 }
 
-async function transcribe(wavB64: string): Promise<string> {
+export async function transcribe(wavB64: string): Promise<string> {
   const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
     headers: {

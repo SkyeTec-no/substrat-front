@@ -70,6 +70,11 @@ export class Floor {
     }
   }
 
+  /** Hand the free floor to someone who addressed Octa by name. */
+  give(id: number) {
+    if (this.holder === null) this.grant(id);
+  }
+
   reset() {
     this.holder = null;
     this.queue = [];

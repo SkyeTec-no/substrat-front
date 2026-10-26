@@ -105,6 +105,16 @@ export class VoiceBook {
     return v ? this.match(v) : null;
   }
 
+  /** Whose voice is in this stretch of audio (mic rate). */
+  async identifyPcm(blocks: Float32Array[]): Promise<VoiceMatch | null> {
+    if (!this.prints.size) return null;
+    let pcm = join(blocks);
+    const rate = this.mic.sampleRate;
+    if (pcm.length > rate * 6) pcm = pcm.subarray(pcm.length - rate * 6);
+    const v = await embed(to16k(pcm, rate));
+    return v ? this.match(v) : null;
+  }
+
   /** A live guess at who's talking, for the tiles. Cheap to call every frame. */
   tickLive(level: number) {
     const now = performance.now();
