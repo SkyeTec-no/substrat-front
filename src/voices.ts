@@ -45,6 +45,12 @@ export class VoiceBook {
     });
   }
 
+  /** A number went to someone new: whatever was learned under it isn't theirs. */
+  forget(id: number) {
+    this.prints.delete(id);
+    this.enrol.delete(id);
+  }
+
   /** How many refinements a person's voiceprint has had (0 = unknown voice). */
   known(id: number): number {
     return this.prints.get(id)?.n ?? 0;

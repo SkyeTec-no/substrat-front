@@ -59,6 +59,8 @@ export interface GestureEvents {
   onMeeting?: (s: MeetingState) => void;
   /** The floor holder started talking while facing Octa — time to listen. */
   onHolderTalk?: (person: number) => void;
+  /** A number was given to someone Octa can't tie to anyone it saw before. */
+  onNewPerson?: (person: number) => void;
 }
 
 const PINCH_ON = 0.38; // thumb-index distance / hand size — with hysteresis
@@ -70,7 +72,9 @@ const MAX_HANDS = 4;
 const VISION_MS = 50; // 20 ticks a second → 10 Hz hands, 10 Hz people/lips
 const HAND_INPUT_W = 960; // the hand model gets a downscaled frame
 const POSE_INPUT = 512; // pose tiles are downscaled to at most this (px, longest side)
-const PERSON_TTL = 2500; // ms a person may go unseen before they're dropped
+// ms a person may go unseen before they're dropped: long enough to look down,
+// lean out of frame or turn around without being mistaken for someone new
+const PERSON_TTL = 6000;
 const CROP = 256; // face crops are analysed at this size (px, square)
 const FACE_FRESH = 500; // ms a face-mesh read stays the authority on gaze
 const HAND_TTL = 300; // ms a hand track survives a missed frame
@@ -261,7 +265,6 @@ export class GestureControl {
   private running = false;
 
   private persons: Person[] = [];
-  private nextPersonId = 1;
   private tracks: HandTrack[] = [];
   private nextHandId = 1;
   private floor: Floor | null = null;
@@ -296,8 +299,11 @@ export class GestureControl {
   private talkSince = 0; // floor holder: lips moving while facing Octa since…
   private talkFired = false;
 
+  private events: GestureEvents | null = null;
+
   /** cameraId: a meeting-room camera from the device list ("" = default). */
   async start(events: GestureEvents, cameraId = "") {
+    this.events = events;
     const fileset = await FilesetResolver.forVisionTasks("/mediapipe-wasm");
     this.recognizer = await GestureRecognizer.createFromOptions(fileset, {
       baseOptions: {
@@ -571,11 +577,13 @@ export class GestureControl {
     const face = [0, 2, 5].filter(vis);
     const head = face.length ? face : [7, 8].filter(vis);
     if (!head.length) {
-      // turned away (no face, no ears): keep whoever owns this torso alive
-      if (box) {
-        const owner = this.persons.find((p) => this.sameBody(p, box, null));
-        if (owner) owner.lastSeen = now;
-      }
+      // turned away (no face, no ears): keep whoever owns this body alive —
+      // by torso, or by any visible point inside their reach
+      const seen = [0, 2, 5, 7, 8, 11, 12, 13, 14, 15, 16].filter(vis).map((i) => pts[i]);
+      const owner =
+        (box && this.persons.find((p) => this.sameBody(p, box, null))) ||
+        this.persons.find((p) => seen.some((q) => this.inReach(p, q.x, q.y)));
+      if (owner) owner.lastSeen = now;
       return;
     }
     const cx = head.reduce((a, i) => a + pts[i].x, 0) / head.length;
@@ -667,8 +675,17 @@ export class GestureControl {
       this.candidates = this.candidates.filter((c) => c !== cand);
       // someone who just left and came back keeps their number and portrait
       const ghost = this.reclaim(cx, cy, w);
+      // otherwise the lowest number not in use — alone in the room you're
+      // always 1, however often Octa loses sight of you
+      let id = ghost?.id;
+      if (id === undefined) {
+        id = 1;
+        while (this.persons.some((p) => p.id === id)) id++;
+        this.gone = this.gone.filter((g) => g.id !== id);
+        this.events?.onNewPerson?.(id);
+      }
       best = {
-        id: ghost?.id ?? this.nextPersonId++, cx, cy, w, h, top: 0, ears, wrists, lastSeen: now,
+        id, cx, cy, w, h, top: 0, ears, wrists, lastSeen: now,
         poseFacing, faceAt: 0, raiseSince: 0, raiseFired: false,
         portrait: ghost?.portrait ?? null, portraitAt: ghost?.portraitAt ?? 0,
         box: box ?? { x0: cx - w, y0: cy + h * 0.6, x1: cx + w, y1: cy + h * 2.5 },

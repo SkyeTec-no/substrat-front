@@ -1321,6 +1321,7 @@ async function enableHandGestures() {
         }
         claimHighlight("hand", hover);
       },
+      onNewPerson: (id) => voices?.forget(id),
       onHolderTalk: () => {
         // talk-to-listen: the floor holder faces Octa and starts speaking
         if (!settings.handGestures || !settings.autoListen) return;
