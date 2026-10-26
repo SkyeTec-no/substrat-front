@@ -207,6 +207,82 @@ export class Soundscape {
     osc.stop(t + 0.35);
   }
 
+  // robot-voice carrier: a low buzz that only sounds while Octa speaks,
+  // pumped open on every word so it moves with the speech like a vocoder
+  private robot: { oscs: OscillatorNode[]; gain: GainNode } | null = null;
+
+  robotStart() {
+    if (this.robot) return;
+    const t = this.ctx.currentTime;
+    const gain = this.ctx.createGain();
+    gain.gain.setValueAtTime(0.0001, t);
+    const lp = this.ctx.createBiquadFilter();
+    lp.type = "lowpass";
+    lp.frequency.value = 1900;
+    lp.Q.value = 4;
+    const oscs = [
+      // a young voice's range: ~120 Hz fundamental, not a bass drone
+      { type: "sawtooth" as OscillatorType, f: 123 },
+      { type: "square" as OscillatorType, f: 246.7 }, // a hair off the octave: metallic beating
+    ].map(({ type, f }) => {
+      const o = this.ctx.createOscillator();
+      o.type = type;
+      o.frequency.value = f;
+      o.connect(lp);
+      o.start(t);
+      return o;
+    });
+    lp.connect(gain).connect(this.master);
+    this.robot = { oscs, gain };
+  }
+
+  /** One word: pump the buzz open, then let it fall back. */
+  robotWord() {
+    if (!this.robot) return;
+    const t = this.ctx.currentTime;
+    const g = this.robot.gain.gain;
+    g.cancelScheduledValues(t);
+    g.setValueAtTime(Math.max(0.0001, g.value), t);
+    g.exponentialRampToValueAtTime(0.03, t + 0.012);
+    g.exponentialRampToValueAtTime(0.004, t + 0.16);
+    this.chirp();
+    if (Math.random() < 0.3) setTimeout(() => this.chirp(), 55); // the odd double-blip
+  }
+
+  robotStop() {
+    if (!this.robot) return;
+    const { oscs, gain } = this.robot;
+    this.robot = null;
+    const t = this.ctx.currentTime;
+    gain.gain.cancelScheduledValues(t);
+    gain.gain.setValueAtTime(Math.max(0.0001, gain.gain.value), t);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.12);
+    for (const o of oscs) o.stop(t + 0.15);
+  }
+
+  /** Robot-voice chatter: a tiny bandpassed square chirp, quiet enough to sit
+   *  under the words like a vocoder's edge rather than on top of them. */
+  chirp() {
+    const t = this.ctx.currentTime;
+    const freqs = [1320, 1760, 2093, 2637];
+    const f = freqs[Math.floor(Math.random() * freqs.length)];
+    const osc = this.ctx.createOscillator();
+    osc.type = "square";
+    osc.frequency.setValueAtTime(f, t);
+    osc.frequency.exponentialRampToValueAtTime(f * (Math.random() < 0.5 ? 0.5 : 1.5), t + 0.04);
+    const band = this.ctx.createBiquadFilter();
+    band.type = "bandpass";
+    band.frequency.value = f;
+    band.Q.value = 6;
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.018, t + 0.004);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.05);
+    osc.connect(band).connect(g).connect(this.master);
+    osc.start(t);
+    osc.stop(t + 0.06);
+  }
+
   /** Random data-blips while thinking. */
   private scheduleBlip() {
     if (this.state !== "thinking") return;

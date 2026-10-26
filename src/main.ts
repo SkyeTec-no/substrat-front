@@ -3,7 +3,7 @@ import { OctaScene, type OctaState } from "./scene";
 import { Soundscape } from "./sound";
 import { MicMeter, Recognizer, Speaker } from "./speech";
 import { think } from "./brain";
-import { settings, listModels, type ChatResult, type ModelTier } from "./openrouter";
+import { settings, listModels, type ChatResult, type ModelTier, type VoiceStyle } from "./openrouter";
 import { respond, keynote, repairMermaid, generateReport, generateCompliments } from "./agents";
 import { remember, clearHistory } from "./history";
 import { renderMermaidSvg } from "./visuals";
@@ -30,6 +30,11 @@ initTheme();
 scene.setTheme(theme());
 onThemeChange((t) => scene.setTheme(t));
 const speaker = new Speaker();
+speaker.onStartFx = () => sound?.robotStart();
+speaker.onWordFx = () => sound?.robotWord();
+speaker.onEndFx = () => sound?.robotStop();
+// a glitch in the voice tears the picture too
+speaker.vader.onGlitch = (strength, ms) => scene.glitch(strength, ms);
 const mic = new MicMeter();
 
 let sound: Soundscape | null = null;
@@ -194,8 +199,43 @@ const AGENT_VOICE_LINES: Record<string, string[]> = {
 };
 
 // spoken once when a parallel fan-out begins (labels are model-chosen there)
+// spoken fillers while the LLM round-trip is in flight
+const FILLERS = ["Et øyeblikk.", "Jobber med det.", "Er på saken.", "La meg tenke.", "Fortsatt i gang."];
+
+/** Lines Octa says again and again: pre-generated in the Vader voice and kept
+ *  in IndexedDB, so they play the instant they're needed. */
+function stockLines(): string[] {
+  return [
+    ...FILLERS,
+    ...Object.values(AGENT_VOICE_LINES).flat(),
+    ...FANOUT_LINES,
+    "Mørk modus.", "Lys modus.",
+    "Tilbake i hylla.", "Lagt bort.", "Ryddet.",
+    "Åpner.", "Her er den.", "I fokus.",
+    "Henter den tilbake.", "På skjermen.", "Vær så god.",
+    "Alt fjernet.", "Skjermen er tom.", "Borte.", "Fjernet.", "Vekk.",
+    "Ingenting er i fokus.", "Det er ingenting å åpne.", "Det er ingenting å hente tilbake ennå.",
+    "Skjermen er allerede tom.", "Det er ingenting å laste ned ennå.",
+    "Lagret den i nedlastinger.",
+    "Bytter til den smarte modellen.", "Tilbake til den raske modellen.",
+    "Jeg bruker allerede den smarte modellen.", "Jeg bruker allerede den raske modellen.",
+    "Notatmodus på. Kryss hendene eller si «stopp notater» når du er ferdig.",
+    "Notatene er lagret.", "Notatmodus av.", "Gestestyring er på.",
+    "Jeg så ikke at du snakket. Si det gjerne igjen.",
+    "Jeg fikk ikke kontakt med modellen. Sjekk innstillingene.",
+    ...[1, 2, 3, 4, 5, 6].map((n) => `P${n}, værsågod.`),
+  ];
+}
+
+let warming = false;
+function warmVoice() {
+  if (warming || settings.voiceStyle !== "vader" || !settings.key) return;
+  warming = true;
+  void speaker.vader.warm(stockLines()).finally(() => (warming = false));
+}
+
 const FANOUT_LINES = [
-  "I'm calling out to my sub-agents.",
+  "Jeg kaller inn underagentene mine.",
   "Deler dette på agentene mine.",
   "Sender ut teamet.",
   "Sender ut agentene.",
@@ -664,14 +704,13 @@ async function converse() {
   void refreshCompliments(); // top up the personal filler pool in the background
 
   // spoken fillers while the LLM round-trip is in flight — same low-latency TTS
-  const FILLERS = ["Et øyeblikk.", "Jobber med det.", "Er på saken.", "La meg tenke.", "Fortsatt i gang."];
   let fillerCount = 0;
   let fillerTimer = 0;
   const scheduleFiller = (delay: number) => {
     fillerTimer = window.setTimeout(() => {
       if (myTurn !== turnId || state !== "thinking") return;
       // agent announcements outrank generic fillers — never talk over them
-      if (!speechSynthesis.speaking) {
+      if (!speaker.speaking) {
         // first beat is a quick generic; later beats credit the user's look/room
         const compliment = fillerCount > 0 ? takeCompliment() : undefined;
         const line = compliment ?? FILLERS[Math.min(fillerCount, FILLERS.length - 1)];
@@ -766,6 +805,12 @@ const imageModelList = document.querySelector<HTMLDataListElement>("#image-model
 const agentsCheck = document.querySelector<HTMLInputElement>("#or-agents")!;
 const handsCheck = document.querySelector<HTMLInputElement>("#or-hands")!;
 const voiceSelect = document.querySelector<HTMLSelectElement>("#or-voice")!;
+const voiceStyleSelect = document.querySelector<HTMLSelectElement>("#or-voice-style")!;
+voiceStyleSelect.value = settings.voiceStyle;
+voiceStyleSelect.addEventListener("change", () => {
+  settings.voiceStyle = voiceStyleSelect.value as VoiceStyle;
+  if (settings.voiceStyle === "vader") warmVoice();
+});
 
 const jevModeSelect = document.querySelector<HTMLSelectElement>("#jev-mode")!;
 jevModeSelect.value = jevSettings.mode;
@@ -896,7 +941,10 @@ settingsBtn.addEventListener("click", async () => {
   }
 });
 
-keyInput.addEventListener("change", () => (settings.key = keyInput.value.trim()));
+keyInput.addEventListener("change", () => {
+  settings.key = keyInput.value.trim();
+  warmVoice();
+});
 modelInput.addEventListener("change", () => (settings.fastModel = modelInput.value.trim()));
 smartModelInput.addEventListener("change", () => (settings.smartModel = smartModelInput.value.trim()));
 imageModelInput.addEventListener("change", () => (settings.imageModel = imageModelInput.value.trim()));
@@ -929,6 +977,7 @@ startBtn.addEventListener("click", async () => {
 
   // warm up the TTS voice list (loads async in most browsers)
   speechSynthesis.getVoices();
+  warmVoice(); // fillers and confirmations ready before they're needed
 
   if (settings.handGestures) enableHandGestures();
 });
@@ -1230,6 +1279,7 @@ Object.assign(window, {
 
 const participantsEl = document.querySelector<HTMLDivElement>("#participants")!;
 let participantsAt = 0;
+let breathAt = 0;
 // set from the console (octa.previewParticipants) to style the strip without a camera
 let participantsPreview: ParticipantView | null = null;
 
@@ -1246,6 +1296,11 @@ function frame() {
   drawCamView();
   // participant tiles: 10 updates a second is plenty for gaze and hands
   const now = performance.now();
+  // the respirator keeps going while Octa thinks
+  if (state === "thinking" && settings.voiceStyle === "vader" && !speaker.speaking && now - breathAt > 4800) {
+    breathAt = now;
+    speaker.vader.breatheCycle();
+  }
   if (now - participantsAt > 100) {
     participantsAt = now;
     renderParticipants(

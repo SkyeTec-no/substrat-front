@@ -4,6 +4,39 @@ import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
 import { AfterimagePass } from "three/addons/postprocessing/AfterimagePass.js";
 import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
 import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
+import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
+
+/** Transmission glitch: RGB channels pull apart and a few horizontal bands
+ *  tear sideways. Idle at amount 0 — a pass-through. */
+const GLITCH_SHADER = {
+  uniforms: {
+    tDiffuse: { value: null },
+    uAmount: { value: 0 },
+    uAngle: { value: 0 },
+    uTear: { value: 0 },
+    uSeed: { value: 0 },
+  },
+  vertexShader: `
+    varying vec2 vUv;
+    void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+  fragmentShader: `
+    uniform sampler2D tDiffuse;
+    uniform float uAmount, uAngle, uTear, uSeed;
+    varying vec2 vUv;
+    float hash(float n) { return fract(sin(n) * 43758.5453); }
+    void main() {
+      vec2 uv = vUv;
+      // a handful of bands shift sideways
+      float band = floor(uv.y * 18.0 + uSeed * 7.0);
+      float h = hash(band + uSeed * 13.0);
+      if (h > 0.78) uv.x += (hash(band * 3.1 + uSeed) - 0.5) * uTear;
+      vec2 off = uAmount * vec2(cos(uAngle), sin(uAngle));
+      vec4 c = texture2D(tDiffuse, uv);
+      float r = texture2D(tDiffuse, uv + off).r;
+      float b = texture2D(tDiffuse, uv - off).b;
+      gl_FragColor = vec4(r, c.g, b, c.a);
+    }`,
+};
 import gsap from "gsap";
 
 export type OctaState = "idle" | "listening" | "thinking" | "speaking" | "noting";
@@ -242,6 +275,8 @@ export class OctaScene {
     this.composer.addPass(this.afterimage);
     this.bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.15, 0.6, 0.85);
     this.composer.addPass(this.bloom);
+    this.glitchPass = new ShaderPass(GLITCH_SHADER);
+    this.composer.addPass(this.glitchPass);
     this.composer.addPass(new OutputPass());
 
     this.resize();
@@ -249,6 +284,28 @@ export class OctaScene {
   }
 
   private backdrop!: THREE.Mesh;
+  private glitchPass!: ShaderPass;
+  private glitchJolt = { x: 0, y: 0, s: 1 };
+
+  /** A transmission glitch: colour channels split, bands tear, the body
+   *  jolts — a beat or two, then snaps back. Strength 0..1. */
+  glitch(strength = 1, ms = 220) {
+    const u = this.glitchPass.uniforms;
+    const dur = ms / 1000;
+    gsap.killTweensOf([u.uAmount, u.uTear, this.glitchJolt]);
+    u.uAngle.value = Math.random() * Math.PI * 2;
+    // re-seed a few times so the tear flickers instead of holding still
+    const flicker = () => (u.uSeed.value = Math.random() * 100);
+    flicker();
+    const ticks = Math.max(2, Math.round(ms / 60));
+    for (let i = 1; i < ticks; i++) gsap.delayedCall((dur / ticks) * i, flicker);
+    gsap.fromTo(u.uAmount, { value: 0.012 * strength }, { value: 0, duration: dur, ease: "steps(4)" });
+    gsap.fromTo(u.uTear, { value: 0.06 * strength }, { value: 0, duration: dur, ease: "steps(3)" });
+    this.glitchJolt.x = (Math.random() - 0.5) * 0.12 * strength;
+    this.glitchJolt.y = (Math.random() - 0.5) * 0.06 * strength;
+    this.glitchJolt.s = 1 + (Math.random() - 0.3) * 0.08 * strength;
+    gsap.to(this.glitchJolt, { x: 0, y: 0, s: 1, duration: dur, ease: "steps(3)" });
+  }
   private bloom!: UnrealBloomPass;
   private octaGhosts: THREE.LineSegments[] = [];
   private octaHistory: { e: THREE.Euler; s: number; y: number }[] = [];
@@ -973,10 +1030,11 @@ export class OctaScene {
         ? lv * 0.22
         : 0;
     const breathe = this.state === "thinking" ? Math.sin(t * 3.2) * 0.03 : 0;
-    const s = (p.scale + voiceScale + breathe) * this.pulseScale.v * this.shapeScale.v;
+    const s = (p.scale + voiceScale + breathe) * this.pulseScale.v * this.shapeScale.v * this.glitchJolt.s;
     this.octa.scale.setScalar(s);
 
-    this.octa.position.y = Math.sin(t * 1.1) * p.floatAmp;
+    this.octa.position.y = Math.sin(t * 1.1) * p.floatAmp + this.glitchJolt.y;
+    this.octa.position.x = this.glitchJolt.x;
 
     // panels: bob + fast-reactive pan/zoom lerp; streaming ones redraw
     const viewAlpha = 1 - Math.exp(-dt * 22);

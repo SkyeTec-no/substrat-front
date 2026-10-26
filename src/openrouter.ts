@@ -40,6 +40,7 @@ export interface ChatResult {
 }
 
 export type ModelTier = "fast" | "smart";
+export type VoiceStyle = "vader" | "robot" | "plain";
 
 export const settings = {
   get key() { return localStorage.getItem("octa-or-key") ?? ""; },
@@ -63,6 +64,14 @@ export const settings = {
   set imageModel(v: string) { localStorage.setItem("octa-or-image-model", v); },
   get voice() { return localStorage.getItem("octa-voice") ?? ""; }, // "" = auto
   set voice(v: string) { localStorage.setItem("octa-voice", v); },
+  /** vader: gpt-audio through the mask chain · robot: system voice pitched
+   *  down with buzz and chirps · plain: the system voice as is. */
+  get voiceStyle(): VoiceStyle {
+    const v = localStorage.getItem("octa-voice-style");
+    return v === "robot" || v === "plain" ? v : "vader";
+  },
+  set voiceStyle(v: VoiceStyle) { localStorage.setItem("octa-voice-style", v); },
+  get robotVoice() { return this.voiceStyle !== "plain"; },
   get handGestures() { return localStorage.getItem("octa-hand-gestures") === "1"; },
   set handGestures(v: boolean) { localStorage.setItem("octa-hand-gestures", v ? "1" : "0"); },
 };
