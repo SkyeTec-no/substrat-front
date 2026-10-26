@@ -9,7 +9,7 @@ import { respond, keynote, repairMermaid, generateReport, generateCompliments, g
 import { remember, clearHistory } from "./history";
 import { renderMermaidSvg } from "./visuals";
 import { isDownloadCommand, downloadArtifacts } from "./download";
-import { tierCommand, isShelveAll, addressesOcta, isDeictic, zoomCommand, findPanel, isRecallCommand, isDismissCommand, isDismissAll, isOpenCommand, isShelveCommand, isNoteCommand, isStopNotesCommand, isReportCommand } from "./commands";
+import { tierCommand, isShelveAll, addressesOcta, isCancelCommand, isDeictic, zoomCommand, findPanel, isRecallCommand, isDismissCommand, isDismissAll, isOpenCommand, isShelveCommand, isNoteCommand, isStopNotesCommand, isReportCommand } from "./commands";
 import { buildReportPdf, type ReportArtifact } from "./report";
 import { loadImage, svgToCanvas, createTableRenderer, createWipeRenderer, createSlideRenderer, noteToCanvas } from "./panels";
 import { GestureControl, captureCameraFrame, type HandState, type MeetingState } from "./gestures";
@@ -496,6 +496,25 @@ function createRecognizer(): SpeechCapture {
 let lastResult: ChatResult | null = null; // artifacts "download it" refers to
 let lastSvgMarkup: string | null = null; // rendered mermaid, for SVG download
 
+let turnAsker: number | null = null; // who asked the question being worked on
+let busySaidAt = 0;
+
+/** Asked again while busy: keep working, and say so (not every time). */
+function busyNotice() {
+  if (performance.now() - busySaidAt < 5000) return;
+  busySaidAt = performance.now();
+  if (state !== "thinking") {
+    sound?.ping(784, 0.05); // mid-answer: don't talk over itself
+    return;
+  }
+  const msg = "Vent litt … jobber med det siste spørsmålet.";
+  showTranscript(msg, true);
+  speaker.speak(msg, () => {
+    scene.pulse(0.6);
+    speakLevel = 0.35;
+  });
+}
+
 /** Drop the current turn: silence TTS, clear satellites, invalidate in-flight work. */
 function interrupt() {
   turnId++;
@@ -526,7 +545,7 @@ function resolvePanel(heard: string, opts: { fallback: "focused" | "latest" | "n
  *   addressed it by name ("Okta, …"), and then give them the floor.
  * - given: the words were already heard (a "Okta, …" line from the minutes).
  */
-async function converse(opts: { wakeOnly?: boolean; candidate?: number; given?: { text: string; who: number | null } } = {}) {
+async function converse(opts: { wakeOnly?: boolean; candidate?: number; given?: { text: string; who: number | null }; force?: boolean } = {}) {
   if (noteMode) return; // the scribe owns the microphone
   sound?.ensureRunning();
 
@@ -536,10 +555,17 @@ async function converse(opts: { wakeOnly?: boolean; candidate?: number; given?: 
     return;
   }
   if (state === "thinking" || state === "speaking") {
-    interrupt(); // barge-in: drop the current turn and listen right away
+    // a question being answered gets finished — only a deliberate press
+    // (tap, space) barges in; anything else hears "vent litt"
+    if (!opts.force) {
+      busyNotice();
+      return;
+    }
+    interrupt();
   }
 
   const myTurn = ++turnId;
+  turnAsker = opts.given?.who ?? floorHolder;
   setState("listening");
   showTranscript("");
   // artifacts stay on screen while listening — "download it" needs them
@@ -1220,6 +1246,8 @@ startBtn.addEventListener("click", async () => {
       meeting.onLine = (line) => {
         if (call) followCall(line);
         else if (addressesOcta(line.text)) heardCall(line);
+        // "stopp" from whoever asked, while Octa works on it, needs no name
+        else if (state === "thinking" && isCancelCommand(line.text)) heardCall(line);
       };
     }
     meeting.enabled = settings.meetingLog;
@@ -1300,7 +1328,7 @@ canvas.addEventListener("pointerup", () => {
     return;
   }
   if (hit?.focused) return; // taps on the focused panel are gesture territory
-  converse();
+  converse({ force: true });
 });
 
 canvas.addEventListener("dblclick", (e) => {
@@ -1397,9 +1425,22 @@ async function answerCall() {
     callers.find((l) => idOf(l.who) !== null && gestures?.isLooking(idOf(l.who)!)) ??
     callers[0];
   const id = idOf(pick.who);
-  // being called beats whatever Octa was doing — but never cut a capture
+  // never cut a capture; and a question being worked on gets finished —
+  // unless whoever asked it calls it off ("Okta, stopp")
   if (state === "listening") return;
-  if (state === "thinking" || state === "speaking") interrupt();
+  if (state === "thinking" || state === "speaking") {
+    const asker = batch.find((l) => isCancelCommand(l.text) && (turnAsker === null || idOf(l.who) === null || idOf(l.who) === turnAsker));
+    if (!asker) {
+      busyNotice();
+      return;
+    }
+    interrupt();
+    setState("speaking");
+    showTranscript("Greit, jeg dropper det.");
+    await speaker.speak("Greit, jeg dropper det.", () => scene.pulse(0.6));
+    setState("idle");
+    return;
+  }
   if (id !== null) gestures?.takeFloor(id);
   if (crowd) {
     setState("speaking");
@@ -1593,7 +1634,7 @@ addEventListener("keydown", (e) => {
   if (e.code !== "Space") return;
   if (document.activeElement instanceof HTMLInputElement) return;
   e.preventDefault();
-  converse();
+  converse({ force: true });
 });
 
 // debug hook: octa.agentEvents.onSpawn("x", "test") from the console

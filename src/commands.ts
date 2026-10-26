@@ -19,6 +19,14 @@ export function addressesOcta(text: string): boolean {
   return /(?<!\p{L})(okta|octa|åkta|okka|oktan)(?!\p{L})/iu.test(text);
 }
 
+/** "Okta, stopp" / "avbryt" / "glem det" — drop the answer in progress. Short
+ *  lines only, so "hvorfor stopper toget?" isn't a cancel. */
+export function isCancelCommand(text: string): boolean {
+  const rest = text.replace(/(?<!\p{L})(okta|octa|åkta|okka|oktan)(?!\p{L})/giu, " ").trim();
+  if (rest.split(/\s+/).filter(Boolean).length > 5) return false;
+  return /(?<!\p{L})(stopp|stop|avbryt|glem det|glem det der|hold opp|la være|drit i det|kanseller|cancel|never mind|nok nå|det holder)(?!\p{L})/iu.test(rest);
+}
+
 /** "this / that" — the command means whatever is being pointed at. */
 export function isDeictic(text: string): boolean {
   return /\b(denne|dette|den her|det her|this|that one|this one)\b/i.test(text);
