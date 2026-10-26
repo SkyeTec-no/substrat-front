@@ -4,7 +4,9 @@ import type { ChatResult } from "./openrouter";
 export function isDownloadCommand(text: string): boolean {
   return (
     /\b(download|save|export)\b.{0,24}\b(it|that|this|them|image|picture|photo|diagram|chart|table|file|visual)\b/i.test(text) ||
-    /^\s*(please\s+)?(download|save|export)(\s+(it|that|this|please))*\s*[.!]?\s*$/i.test(text)
+    /^\s*(please\s+)?(download|save|export)(\s+(it|that|this|please))*\s*[.!]?\s*$/i.test(text) ||
+    /\b(last ned|lagre|eksporter)\b.{0,24}\b(den|det|dette|dem|bildet|diagrammet|grafen|tabellen|fila|filen)\b/i.test(text) ||
+    /^\s*(last ned|lagre|eksporter)(\s+(den|det|dette))?\s*[.!]?\s*$/i.test(text)
   );
 }
 

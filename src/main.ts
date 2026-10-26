@@ -3,16 +3,18 @@ import { OctaScene, type OctaState } from "./scene";
 import { Soundscape } from "./sound";
 import { MicMeter, Recognizer, Speaker } from "./speech";
 import { think } from "./brain";
-import { settings, listModels, type ChatResult } from "./openrouter";
-import { respond, repairMermaid, generateReport, generateCompliments } from "./agents";
+import { settings, listModels, type ChatResult, type ModelTier } from "./openrouter";
+import { respond, keynote, repairMermaid, generateReport, generateCompliments } from "./agents";
 import { remember, clearHistory } from "./history";
 import { renderMermaidSvg } from "./visuals";
 import { isDownloadCommand, downloadArtifacts } from "./download";
-import { isRecallCommand, isDismissCommand, isDismissAll, isOpenCommand, isShelveCommand, isNoteCommand, isStopNotesCommand, isReportCommand, matchPanel } from "./commands";
+import { tierCommand, isRecallCommand, isDismissCommand, isDismissAll, isOpenCommand, isShelveCommand, isNoteCommand, isStopNotesCommand, isReportCommand, matchPanel } from "./commands";
 import { buildReportPdf, type ReportArtifact } from "./report";
-import { loadImage, svgToCanvas, createTableRenderer, createWipeRenderer, noteToCanvas } from "./panels";
-import { GestureControl, captureCameraFrame } from "./gestures";
+import { loadImage, svgToCanvas, createTableRenderer, createWipeRenderer, createSlideRenderer, noteToCanvas } from "./panels";
+import { GestureControl, captureCameraFrame, type HandState, type MeetingState } from "./gestures";
 import { theme, setDarkMode, initTheme, onThemeChange } from "./theme";
+import { renderParticipants, type ParticipantView } from "./participants";
+import { jevSettings, jevLog, jevLogCsv, checkAddressee, type JevMode } from "./jev";
 
 const canvas = document.querySelector<HTMLCanvasElement>("#scene")!;
 const statusEl = document.querySelector<HTMLDivElement>("#status")!;
@@ -23,6 +25,7 @@ const overlay = document.querySelector<HTMLDivElement>("#overlay")!;
 const startBtn = document.querySelector<HTMLButtonElement>("#start")!;
 
 const scene = new OctaScene(canvas);
+scene.setShape(settings.tier === "smart" ? "icosahedron" : "octahedron", false);
 initTheme();
 scene.setTheme(theme());
 onThemeChange((t) => scene.setTheme(t));
@@ -99,7 +102,7 @@ async function presentArtifacts(result: ChatResult, heard: string) {
             console.error(repairErr);
           }
         }
-        showTranscript(`${result.text} (the diagram failed to render)`);
+        showTranscript(`${result.text} (diagrammet kunne ikke vises)`);
       }
     }
   } else if (result.visual) {
@@ -116,9 +119,17 @@ async function presentArtifacts(result: ChatResult, heard: string) {
       scene.addPanel(chartId, wipe.canvas, desc, { animate: wipe.draw });
       panelArtifacts.set(chartId, { kind: "chart", desc, source: wipe.canvas, svgMarkup: svgEl.outerHTML });
     } catch (err) {
-      showTranscript(`${result.text} (the chart failed to render)`);
+      showTranscript(`${result.text} (grafen kunne ikke vises)`);
       console.error(err);
     }
+  }
+
+  if (result.slide) {
+    ensureShelved();
+    const slide = createSlideRenderer(result.slide);
+    const slideId = `panel-${Date.now()}-slide`;
+    scene.addPanel(slideId, slide.canvas, desc, { animate: slide.draw });
+    panelArtifacts.set(slideId, { kind: "slide", desc, source: slide.canvas, slide: result.slide });
   }
 
   if (result.table) {
@@ -138,62 +149,72 @@ let agentIndex = 0;
 // spoken when a specialist agent activates — keyed by its spawn label
 const AGENT_VOICE_LINES: Record<string, string[]> = {
   searching: [
-    "Now doing a web search.",
-    "Reaching out to the live web.",
-    "Scanning the web for this.",
-    "Pulling fresh data.",
-    "Consulting the outside world.",
+    "Jeg søker på nettet.",
+    "Henter ferske kilder.",
+    "Sjekker nettet for deg.",
+    "Henter ferske data.",
+    "Spør omverdenen.",
   ],
   imagining: [
-    "Artist agent in action.",
-    "The artist is at work.",
-    "Painting that for you.",
-    "Summoning the artist.",
+    "Kunstneren er i gang.",
+    "Kunstneren jobber.",
+    "Maler det for deg.",
+    "Henter inn kunstneren.",
   ],
   repainting: [
-    "Repainting it now.",
-    "The artist is reworking it.",
-    "Retouching the image.",
-    "Back to the canvas.",
+    "Maler det om nå.",
+    "Kunstneren justerer bildet.",
+    "Retusjerer bildet.",
+    "Tilbake til lerretet.",
   ],
   diagramming: [
-    "Drafting the diagram.",
-    "The architect is sketching.",
-    "Laying out the structure.",
-    "Drawing that up now.",
+    "Tegner diagrammet.",
+    "Arkitekten skisserer.",
+    "Legger opp strukturen.",
+    "Tegner det opp nå.",
   ],
   visualizing: [
-    "Building the visualization.",
-    "Wiring up the chart.",
-    "Plotting the data.",
-    "The data sculptor is on it.",
+    "Bygger visualiseringen.",
+    "Setter opp grafen.",
+    "Plotter dataene.",
+    "Dataskulptøren er på saken.",
   ],
   looking: [
-    "Taking a look at you.",
-    "Let me see.",
-    "Opening my eye.",
-    "Observing.",
+    "Tar en titt på deg.",
+    "La meg se.",
+    "Åpner øyet.",
+    "Observerer.",
   ],
   reporting: [
-    "Compiling the report.",
-    "The analyst is writing.",
-    "Assembling the document.",
-    "Interpreting the canvas.",
+    "Setter sammen rapporten.",
+    "Analytikeren skriver.",
+    "Bygger dokumentet.",
+    "Tolker lerretet.",
   ],
 };
 
 // spoken once when a parallel fan-out begins (labels are model-chosen there)
 const FANOUT_LINES = [
   "I'm calling out to my sub-agents.",
-  "Splitting this across my agents.",
-  "Dispatching the team.",
-  "Sending out my agents.",
-  "Fanning out on this one.",
-  "My agents are on it.",
+  "Deler dette på agentene mine.",
+  "Sender ut teamet.",
+  "Sender ut agentene.",
+  "Sprer oss ut på denne.",
+  "Agentene mine er på saken.",
 ];
 
 const pickLine = (arr: string[]) => arr[Math.floor(Math.random() * arr.length)];
 let fanoutAnnounced = false;
+
+/** Switch Octa's brain; the body morphs to match. Returns false if already there. */
+function setTier(tier: ModelTier): boolean {
+  if (settings.tier === tier) return false;
+  settings.tier = tier;
+  scene.setShape(tier === "smart" ? "icosahedron" : "octahedron");
+  sound?.ping(tier === "smart" ? 1320 : 660, 0.08);
+  console.info(`[tier] ${tier} → ${settings.model}`);
+  return true;
+}
 
 function announce(text: string) {
   speaker.speak(text, () => {
@@ -227,20 +248,36 @@ const agentEvents = {
 
 // --- ambient compliments: camera-grounded filler lines ----------------------
 
-let complimentPool: string[] = [];
-let complimentsAt = 0;
+// In a meeting each person gets their own pool, drawn from a crop of just
+// them — compliments go to whoever holds the floor. Key 0 = no floor holder
+// (solo, or no faces in view): the whole frame, as before.
+const complimentPools = new Map<number, string[]>();
+const complimentsAt = new Map<number, number>();
+
+function complimentTarget() {
+  return gestures?.holderCrop() ?? null;
+}
 
 async function refreshCompliments() {
   if (!settings.key || !gestures) return;
-  if (complimentPool.length >= 2 || Date.now() - complimentsAt < 240_000) return;
-  complimentsAt = Date.now();
+  const target = complimentTarget();
+  const key = target?.person ?? 0;
+  const pool = complimentPools.get(key) ?? [];
+  if (pool.length >= 2 || Date.now() - (complimentsAt.get(key) ?? 0) < 240_000) return;
+  complimentsAt.set(key, Date.now());
   try {
-    const frame = await captureCameraFrame(gestures);
+    const frame = await captureCameraFrame(gestures, target?.crop);
     if (!frame) return;
-    complimentPool.push(...(await generateCompliments(frame)));
+    const lines = await generateCompliments(frame);
+    complimentPools.set(key, [...(complimentPools.get(key) ?? []), ...lines]);
   } catch (err) {
     console.error("compliment refresh failed", err);
   }
+}
+
+/** Next compliment for whoever holds the floor right now. */
+function takeCompliment(): string | undefined {
+  return complimentPools.get(complimentTarget()?.person ?? 0)?.shift();
 }
 
 // --- the brain: OpenRouter when a key is set, local echo otherwise ---------
@@ -249,10 +286,11 @@ async function reply(heard: string, events: typeof agentEvents): Promise<ChatRes
   if (!settings.key) {
     return { text: await think(heard), images: [] };
   }
-  return respond(heard, events, {
+  const result = await respond(heard, events, {
     lastImage: lastResult?.images[0],
     captureFrame: () => captureCameraFrame(gestures),
   });
+  return keynote(result);
 }
 
 /** Rescue chart/diagram code that leaked into reply text: extract it into a
@@ -288,7 +326,7 @@ function salvageVisualFromText(result: ChatResult) {
   }
   if (!code || !kind) return;
   result.visual = { kind, code };
-  result.text = text.replace(matched, "").replace(/\s+/g, " ").trim() || "Here is the chart.";
+  result.text = text.replace(matched, "").replace(/\s+/g, " ").trim() || "Her er grafen.";
 }
 
 /** Strip light markdown so TTS doesn't read symbols aloud. */
@@ -312,7 +350,7 @@ function enterNoteMode() {
   setState("noting");
   // wait for the announcement to actually finish so we don't transcribe ourselves
   speaker
-    .speak("Note taker online. Cross your hands when you are done.", () => {
+    .speak("Notatmodus på. Kryss hendene eller si «stopp notater» når du er ferdig.", () => {
       scene.pulse(0.7);
       speakLevel = 0.4;
     })
@@ -320,7 +358,7 @@ function enterNoteMode() {
 }
 
 // lines that are just Octa hearing itself — never note these
-const SELF_ECHO = /note ?taker (online|off)|cross your hands|notes stored/i;
+const SELF_ECHO = /note ?taker (online|off)|cross your hands|notes stored|notatmodus (på|av)|kryss hendene|notatene er lagret/i;
 
 function noteLoop() {
   if (!noteMode) return;
@@ -352,24 +390,24 @@ function exitNoteMode() {
   setState("idle");
   showTranscript("");
   if (noteLines.length) {
-    const stamp = new Date().toLocaleDateString(undefined, { month: "short", day: "numeric" });
-    const canvas = noteToCanvas(noteLines, `Notes — ${stamp}`);
+    const stamp = new Date().toLocaleDateString("nb-NO", { month: "short", day: "numeric" });
+    const canvas = noteToCanvas(noteLines, `Notater — ${stamp}`);
     const id = `panel-${Date.now()}-note`;
-    const noteDesc = `notes ${noteLines.join(" ").slice(0, 120)}`;
+    const noteDesc = `notater notes ${noteLines.join(" ").slice(0, 120)}`;
     scene.addPanel(id, canvas, noteDesc);
     panelArtifacts.set(id, {
       kind: "note",
       desc: noteDesc,
       source: canvas,
       noteLines: [...noteLines],
-      noteTitle: `Notes — ${stamp}`,
+      noteTitle: `Notater — ${stamp}`,
     });
     setTimeout(() => scene.shelfPanel(id), 1800); // show it, then tuck into the grid
-    remember("assistant", `Notes captured:\n${noteLines.join("\n")}`);
+    remember("assistant", `Notater tatt:\n${noteLines.join("\n")}`);
     sound?.ping(996, 0.08);
-    announce("Notes stored.");
+    announce("Notatene er lagret.");
   } else {
-    announce("Note taker off.");
+    announce("Notatmodus av.");
   }
 }
 
@@ -408,6 +446,7 @@ async function converse() {
 
   const rec = new Recognizer();
   activeRec = rec;
+  const listenSince = performance.now();
   const heard = await new Promise<string | null>((resolve) => {
     rec.onInterim = (t) => showTranscript(t, true);
     rec.onFinal = (t) => resolve(t);
@@ -422,6 +461,62 @@ async function converse() {
     showTranscript("");
     return;
   }
+
+  // in a meeting: only act on speech when the floor holder's lips were moving
+  const mouth = settings.handGestures ? gestures?.holderSpokeSince(listenSince) : null;
+  mouthVerdict = {
+    text: !mouth
+      ? "heard · lips not checked"
+      : mouth.spoke
+        ? `heard P${mouth.holder} ✓`
+        : `dropped · P${mouth.holder} lips ${mouth.movingMs}ms`,
+    ok: !mouth || mouth.spoke,
+    at: performance.now(),
+  };
+  if (mouth && !mouth.spoke) {
+    console.info(
+      `[floor] dropped "${heard}" — P${mouth.holder}: lips ${mouth.movingMs}ms, to Octa ${mouth.toOctaMs}ms, alone ${mouth.alone}`
+    );
+    setState("speaking");
+    // alone in view: the voice came from off camera — don't tell anyone to raise a hand
+    const msg = mouth.alone
+      ? "Jeg så ikke at du snakket. Si det gjerne igjen."
+      : `Jeg hørte noen, men P${mouth.holder} har ordet. De andre kan rekke opp hånden.`;
+    showTranscript(msg);
+    await speaker.speak(msg, () => {
+      scene.pulse(1);
+      speakLevel = 0.5;
+    });
+    if (myTurn === turnId) setState("idle");
+    return;
+  }
+
+  // prototype: Jev judges whether this was said to Octa or to the room
+  if (jevSettings.mode !== "off" && settings.key) {
+    setState("thinking");
+    const v = await checkAddressee(heard, {
+      speaker: mouth?.holder ?? null,
+      facingOcta: mouth ? mouth.facing : null,
+      lipsMoving: mouth ? mouth.moving : null,
+      peopleInView: gestures?.snapshot().persons.length ?? 0,
+    });
+    if (myTurn !== turnId) return;
+    const p = v.noul === null ? "?" : v.noul.toFixed(2);
+    mouthVerdict = {
+      text: `jev ${p} · ${v.latencyMs}ms${v.dropped ? " · dropped" : ""}`,
+      ok: !v.dropped,
+      at: performance.now(),
+    };
+    if (v.dropped) {
+      // said to the room, not to Octa — stay quiet, just show what was set aside
+      showTranscript(`(ikke til meg) ${heard}`, true);
+      setState("idle");
+      setTimeout(() => {
+        if (state === "idle") showTranscript("");
+      }, 3000);
+      return;
+    }
+  }
   showTranscript(heard);
 
   // panel + download commands are handled locally — no model round-trip
@@ -435,28 +530,43 @@ async function converse() {
     if (myTurn === turnId) setState("idle");
   };
 
+  // "bruk en smartere modell" — switch brains locally, no model round-trip;
+  // anything said beyond the command is then answered by the new brain
+  const tier = tierCommand(heard);
+  if (tier) {
+    const switched = setTier(tier);
+    if (heard.split(/\s+/).length <= 8) {
+      await localReply(
+        !switched
+          ? tier === "smart" ? "Jeg bruker allerede den smarte modellen." : "Jeg bruker allerede den raske modellen."
+          : tier === "smart" ? "Bytter til den smarte modellen." : "Tilbake til den raske modellen."
+      );
+      return;
+    }
+  }
+
   if (isDownloadCommand(heard)) {
     const hasArtifacts =
       lastResult && (lastResult.images.length || lastResult.visual || lastResult.table);
     const n = hasArtifacts ? await downloadArtifacts(lastResult!, lastSvgMarkup ?? undefined) : 0;
     await localReply(
       n
-        ? `Saved ${n === 1 ? "it" : `${n} files`} to your downloads.`
-        : "There's nothing to download yet."
+        ? `Lagret ${n === 1 ? "den" : `${n} filer`} i nedlastinger.`
+        : "Det er ingenting å laste ned ennå."
     );
     return;
   }
 
-  if (/\b(dark|night) mode\b/i.test(heard)) {
+  if (/\b(dark|night) mode\b|\bm(ø|o)rk ?modus|\bnattmodus/i.test(heard)) {
     setDarkMode(true);
     darkCheck.checked = true;
-    await localReply("Dark mode.");
+    await localReply("Mørk modus.");
     return;
   }
-  if (/\b(light|day) mode\b/i.test(heard)) {
+  if (/\b(light|day) mode\b|\blys ?modus|\bdagmodus/i.test(heard)) {
     setDarkMode(false);
     darkCheck.checked = false;
-    await localReply("Light mode.");
+    await localReply("Lys modus.");
     return;
   }
 
@@ -467,7 +577,7 @@ async function converse() {
 
   if (isReportCommand(heard)) {
     if (!settings.key) {
-      await localReply("I need an OpenRouter key to write reports.");
+      await localReply("Jeg trenger en OpenRouter-nøkkel for å skrive rapporter.");
       return;
     }
     setState("thinking");
@@ -484,7 +594,7 @@ async function converse() {
     const spec = await generateReport(heard, inventory, events);
     if (myTurn !== turnId) return;
     if (!spec) {
-      await localReply("I couldn't assemble the report. Try again.");
+      await localReply("Jeg fikk ikke satt sammen rapporten. Prøv igjen.");
       return;
     }
     const usable = new Map<string, ReportArtifact>();
@@ -494,7 +604,7 @@ async function converse() {
     const filename = await buildReportPdf(spec, usable);
     remember("user", heard);
     remember("assistant", `Report generated: "${spec.title}" (${filename}).`);
-    await localReply(`Report ready: ${spec.title}. Saved to your downloads.`);
+    await localReply(`Rapporten er klar: ${spec.title}. Lagret i nedlastinger.`);
     return;
   }
 
@@ -503,9 +613,9 @@ async function converse() {
     if (id) {
       scene.shelfPanel(id);
       sound?.ping(996, 0.06);
-      await localReply(pickLine(["Back on the shelf.", "Put away.", "Shelved."]));
+      await localReply(pickLine(["Tilbake i hylla.", "Lagt bort.", "Ryddet."]));
     } else {
-      await localReply("Nothing is in focus.");
+      await localReply("Ingenting er i fokus.");
     }
     return;
   }
@@ -517,9 +627,9 @@ async function converse() {
       [...scene.listPanels()].reverse().find((p) => p.id !== scene.focusedPanelId())?.id;
     if (target && scene.recallPanel(target)) {
       sound?.ping(880, 0.07);
-      await localReply(pickLine(["Opening.", "Here it is.", "In focus."]));
+      await localReply(pickLine(["Åpner.", "Her er den.", "I fokus."]));
     } else {
-      await localReply("There's nothing to open.");
+      await localReply("Det er ingenting å åpne.");
     }
     return;
   }
@@ -527,9 +637,9 @@ async function converse() {
   if (isRecallCommand(heard)) {
     const target = matchPanel(heard, scene.listPanels());
     if (target && scene.recallPanel(target)) {
-      await localReply(pickLine(["Here it is.", "Bringing it back.", "On screen.", "There you go."]));
+      await localReply(pickLine(["Her er den.", "Henter den tilbake.", "På skjermen.", "Vær så god."]));
     } else {
-      await localReply("There's nothing to bring back yet.");
+      await localReply("Det er ingenting å hente tilbake ennå.");
     }
     return;
   }
@@ -537,15 +647,15 @@ async function converse() {
   if (isDismissCommand(heard)) {
     const panels = scene.listPanels();
     if (!panels.length) {
-      await localReply("The screen is already clear.");
+      await localReply("Skjermen er allerede tom.");
     } else if (isDismissAll(heard)) {
       scene.clearPanels();
       visualsEl.innerHTML = "";
-      await localReply(pickLine(["All clear.", "Screen cleared.", "Gone."]));
+      await localReply(pickLine(["Alt fjernet.", "Skjermen er tom.", "Borte."]));
     } else {
       const target = matchPanel(heard, panels);
       if (target) scene.removePanel(target);
-      await localReply(pickLine(["Gone.", "Removed.", "Dismissed."]));
+      await localReply(pickLine(["Borte.", "Fjernet.", "Vekk."]));
     }
     return;
   }
@@ -554,7 +664,7 @@ async function converse() {
   void refreshCompliments(); // top up the personal filler pool in the background
 
   // spoken fillers while the LLM round-trip is in flight — same low-latency TTS
-  const FILLERS = ["One second.", "Working on it.", "On it.", "Let me think.", "Still on it."];
+  const FILLERS = ["Et øyeblikk.", "Jobber med det.", "Er på saken.", "La meg tenke.", "Fortsatt i gang."];
   let fillerCount = 0;
   let fillerTimer = 0;
   const scheduleFiller = (delay: number) => {
@@ -563,10 +673,8 @@ async function converse() {
       // agent announcements outrank generic fillers — never talk over them
       if (!speechSynthesis.speaking) {
         // first beat is a quick generic; later beats credit the user's look/room
-        const line =
-          fillerCount > 0 && complimentPool.length
-            ? complimentPool.shift()!
-            : FILLERS[Math.min(fillerCount, FILLERS.length - 1)];
+        const compliment = fillerCount > 0 ? takeCompliment() : undefined;
+        const line = compliment ?? FILLERS[Math.min(fillerCount, FILLERS.length - 1)];
         fillerCount++;
         speaker.speak(line, () => {
           scene.pulse(0.6);
@@ -599,15 +707,32 @@ async function converse() {
         `\n\n${result.table.title ?? ""}\n${result.table.headers.join(" | ")}\n` +
         result.table.rows.map((r) => r.join(" | ")).join("\n");
     }
+    if (result.slide) {
+      // the slide holds the substance — follow-ups ("tell me more about point 2") need it
+      const sl = result.slide;
+      memText +=
+        `\n\nSlide: ${sl.headline}` +
+        (sl.stat ? `\n${sl.stat.value} — ${sl.stat.label}` : "") +
+        sl.points.map((pt, i) => `\n${i + 1}. ${pt.title}${pt.detail ? `: ${pt.detail}` : ""}`).join("");
+    }
     remember("assistant", memText);
   } catch (err) {
-    result = { text: "I couldn't reach the model. Check the settings panel.", images: [] };
+    result = { text: "Jeg fikk ikke kontakt med modellen. Sjekk innstillingene.", images: [] };
     console.error(err);
   }
   clearTimeout(fillerTimer);
   if (myTurn !== turnId) return;
   agentLabelsEl.innerHTML = "";
   salvageVisualFromText(result);
+  if (result.tier) {
+    // the router heard an indirect "think harder" / "keep it quick"
+    const switched = setTier(result.tier);
+    if (!result.text) {
+      result.text = !switched
+        ? "Den modellen bruker jeg allerede."
+        : result.tier === "smart" ? "Bytter til den smarte modellen." : "Tilbake til den raske modellen.";
+    }
+  }
   lastResult = result;
 
   setState("speaking");
@@ -632,15 +757,97 @@ const settingsPanel = document.querySelector<HTMLDivElement>("#settings")!;
 const keyInput = document.querySelector<HTMLInputElement>("#or-key")!;
 const modelInput = document.querySelector<HTMLInputElement>("#or-model")!;
 const modelList = document.querySelector<HTMLDataListElement>("#model-list")!;
+const smartModelInput = document.querySelector<HTMLInputElement>("#or-smart-model")!;
+const fastEffortSelect = document.querySelector<HTMLSelectElement>("#or-fast-effort")!;
+fastEffortSelect.value = settings.fastEffort;
+fastEffortSelect.addEventListener("change", () => (settings.fastEffort = fastEffortSelect.value));
 const imageModelInput = document.querySelector<HTMLInputElement>("#or-image-model")!;
 const imageModelList = document.querySelector<HTMLDataListElement>("#image-model-list")!;
 const agentsCheck = document.querySelector<HTMLInputElement>("#or-agents")!;
 const handsCheck = document.querySelector<HTMLInputElement>("#or-hands")!;
 const voiceSelect = document.querySelector<HTMLSelectElement>("#or-voice")!;
 
+const jevModeSelect = document.querySelector<HTMLSelectElement>("#jev-mode")!;
+jevModeSelect.value = jevSettings.mode;
+jevModeSelect.addEventListener("change", () => (jevSettings.mode = jevModeSelect.value as JevMode));
+
 const darkCheck = document.querySelector<HTMLInputElement>("#or-dark")!;
 darkCheck.checked = theme().dark;
 darkCheck.addEventListener("change", () => setDarkMode(darkCheck.checked));
+
+// --- camera view: what the gesture camera sees, with faces and hands marked --
+
+const camCheck = document.querySelector<HTMLInputElement>("#or-camview")!;
+const camView = document.querySelector<HTMLCanvasElement>("#camview")!;
+const camCtx = camView.getContext("2d")!;
+// last lip-check verdict, shown in the camera view for a few seconds
+let mouthVerdict: { text: string; ok: boolean; at: number } | null = null;
+
+function setCamView(on: boolean) {
+  camCheck.checked = on;
+  camView.classList.toggle("visible", on);
+}
+camCheck.addEventListener("change", () => setCamView(camCheck.checked));
+
+function drawCamView() {
+  const video = gestures?.videoEl;
+  if (!camCheck.checked) return;
+  const w = 320;
+  const h = video ? Math.round((w * video.videoHeight) / (video.videoWidth || 1)) || 180 : 180;
+  if (camView.width !== w || camView.height !== h) {
+    camView.width = w;
+    camView.height = h;
+  }
+  camCtx.clearRect(0, 0, w, h);
+  camCtx.font = "11px ui-monospace, Menlo, monospace";
+  if (!video || video.readyState < 2 || !gestures) {
+    camCtx.fillStyle = "#8c8677";
+    camCtx.fillText(settings.handGestures ? "starting camera…" : "camera off — enable hand gestures", 10, h / 2);
+    return;
+  }
+  const k = w / video.videoWidth;
+  // mirrored, like the cursors: move right, see yourself move right
+  camCtx.save();
+  camCtx.translate(w, 0);
+  camCtx.scale(-1, 1);
+  camCtx.drawImage(video, 0, 0, w, h);
+  camCtx.restore();
+  const mx = (x: number) => w - x * k;
+  const css = getComputedStyle(document.documentElement);
+  const tint = (id: number | null) =>
+    id === null ? "#8c8677" : css.getPropertyValue(`--person-${(id - 1) % 6}`).trim();
+
+  const snap = gestures.snapshot();
+  for (const p of snap.persons) {
+    camCtx.strokeStyle = tint(p.id);
+    camCtx.lineWidth = p.id === snap.holder ? 3 : 1.5;
+    camCtx.strokeRect(mx(p.x + p.w), p.y * k, p.w * k, p.h * k);
+    camCtx.fillStyle = tint(p.id);
+    const tags =
+      (p.id === snap.holder ? " ●" : "") + (p.looking ? " looking" : "") + (p.talking ? " speaking" : "");
+    camCtx.fillText(`P${p.id}${tags}`, mx(p.x + p.w), p.y * k - 4);
+  }
+  for (const hd of snap.hands) {
+    camCtx.fillStyle = tint(hd.owner);
+    camCtx.beginPath();
+    camCtx.arc(mx(hd.x), hd.y * k, hd.raised ? 7 : 4, 0, Math.PI * 2);
+    camCtx.fill();
+  }
+  camCtx.fillStyle = "rgba(0,0,0,0.55)";
+  camCtx.fillRect(0, h - 18, w, 18);
+  camCtx.fillStyle = "#fff";
+  camCtx.fillText(`faces ${snap.persons.length} · hands ${snap.hands.length}`, 8, h - 6);
+  // mic state on the right: is Octa listening right now, and what did the lip check decide?
+  let mic = state === "listening" ? "● listening" : state;
+  camCtx.fillStyle = state === "listening" ? "#7fd4a0" : "#ccc";
+  if (state !== "listening" && mouthVerdict && performance.now() - mouthVerdict.at < 5000) {
+    mic = mouthVerdict.text;
+    camCtx.fillStyle = mouthVerdict.ok ? "#7fd4a0" : "#ff8a65";
+  }
+  camCtx.textAlign = "right";
+  camCtx.fillText(mic, w - 8, h - 6);
+  camCtx.textAlign = "left";
+}
 
 handsCheck.checked = settings.handGestures;
 handsCheck.addEventListener("change", () => {
@@ -652,7 +859,7 @@ handsCheck.addEventListener("change", () => {
 function populateVoices() {
   const current = settings.voice;
   voiceSelect.innerHTML = '<option value="">auto</option>';
-  for (const v of speechSynthesis.getVoices().filter((v) => v.lang.startsWith("en"))) {
+  for (const v of speechSynthesis.getVoices().filter((v) => /^(nb|no|nn|en)/i.test(v.lang))) {
     const opt = document.createElement("option");
     opt.value = v.name;
     opt.textContent = `${v.name} (${v.lang})`;
@@ -665,7 +872,8 @@ populateVoices();
 voiceSelect.addEventListener("change", () => (settings.voice = voiceSelect.value));
 
 keyInput.value = settings.key;
-modelInput.value = settings.model;
+modelInput.value = settings.fastModel;
+smartModelInput.value = settings.smartModel;
 imageModelInput.value = settings.imageModel;
 agentsCheck.checked = settings.agentsEnabled;
 
@@ -689,7 +897,8 @@ settingsBtn.addEventListener("click", async () => {
 });
 
 keyInput.addEventListener("change", () => (settings.key = keyInput.value.trim()));
-modelInput.addEventListener("change", () => (settings.model = modelInput.value.trim()));
+modelInput.addEventListener("change", () => (settings.fastModel = modelInput.value.trim()));
+smartModelInput.addEventListener("change", () => (settings.smartModel = smartModelInput.value.trim()));
 imageModelInput.addEventListener("change", () => (settings.imageModel = imageModelInput.value.trim()));
 agentsCheck.addEventListener("change", () => (settings.agentsEnabled = agentsCheck.checked));
 
@@ -711,11 +920,11 @@ startBtn.addEventListener("click", async () => {
   try {
     await mic.init();
   } catch {
-    showTranscript("microphone unavailable — visuals only");
+    showTranscript("mikrofonen er utilgjengelig — bare visuelt");
   }
 
   if (!Recognizer.supported()) {
-    showTranscript("speech recognition needs Chrome — visuals only");
+    showTranscript("talegjenkjenning krever Chrome — bare visuelt");
   }
 
   // warm up the TTS voice list (loads async in most browsers)
@@ -793,12 +1002,61 @@ canvas.addEventListener("dblclick", (e) => {
 
 // --- camera hand gestures: pinch-pan, two-hand zoom, palm-hold reset --------
 
-const handDots = [
-  document.querySelector<HTMLDivElement>("#hand-0")!,
-  document.querySelector<HTMLDivElement>("#hand-1")!,
-];
+// one dot per visible hand, tinted by the person it belongs to
+const handDots: HTMLDivElement[] = [];
+const meetingEl = document.querySelector<HTMLDivElement>("#meeting")!;
+
+/** Stable tint per tracked person. */
+function personColor(id: number | null) {
+  return id === null ? "var(--dim)" : `var(--person-${(id - 1) % 6})`;
+}
+
+function renderHandDots(hands: HandState[]) {
+  while (handDots.length < hands.length) {
+    const dot = document.createElement("div");
+    dot.className = "hand-dot";
+    document.body.appendChild(dot);
+    handDots.push(dot);
+  }
+  for (const [i, dot] of handDots.entries()) {
+    const h = hands[i];
+    dot.classList.toggle("visible", !!h);
+    if (!h) continue;
+    dot.style.transform = `translate(${h.x}px, ${h.y}px)`;
+    dot.style.setProperty("--who", personColor(h.person));
+    dot.classList.toggle("pinch", h.pinching && h.active);
+    dot.classList.toggle("passive", !h.active);
+    dot.classList.toggle("raised", h.raised);
+  }
+}
+
+function renderMeeting(m: MeetingState) {
+  meetingEl.innerHTML = "";
+  meetingEl.classList.toggle("visible", m.persons.length > 0 || m.queue.length > 0);
+  const chip = (id: number, role: string) => {
+    const el = document.createElement("span");
+    el.className = `who ${role}`;
+    el.style.setProperty("--who", personColor(id));
+    el.textContent = `P${id}`;
+    return el;
+  };
+  const label = (text: string) => {
+    const el = document.createElement("span");
+    el.className = "label";
+    el.textContent = text;
+    return el;
+  };
+  meetingEl.append(label("floor"));
+  meetingEl.append(m.holder !== null ? chip(m.holder, "holder") : label("— raise a hand"));
+  if (m.queue.length) {
+    meetingEl.append(label("next"));
+    for (const id of m.queue) meetingEl.append(chip(id, "queued"));
+  }
+}
+
 let gestures: GestureControl | null = null;
 let wasPinching = false;
+let floorHolder: number | null = null;
 
 // One mediator for highlight focus: hand hover beats mouse hover.
 // Each source only releases its own claim.
@@ -866,38 +1124,48 @@ async function enableHandGestures() {
         }
       },
       onHead: (nx, ny, size) => scene.setHeadPosition(nx, ny, size),
-      onHands: (hands) => {
+      onHands: (all) => {
+        const hands = settings.handGestures ? all : [];
+        renderHandDots(hands);
+        const steering = hands.filter((h) => h.active);
         // pinch release after an upward pinch-drag also shelves the panel
-        const anyPinch = hands.some((h) => h.pinching);
+        const anyPinch = steering.some((h) => h.pinching);
         if (wasPinching && !anyPinch && settings.handGestures) {
           const id = scene.focusedPanelId();
           if (id && scene.maybeShelfAfterDrag(id)) sound?.ping(996, 0.06);
         }
         wasPinching = anyPinch;
         let hover: string | null = null;
-        for (const [i, dot] of handDots.entries()) {
-          const h = settings.handGestures ? hands[i] : undefined;
-          dot.classList.toggle("visible", !!h);
-          if (h) {
-            dot.style.transform = `translate(${h.x}px, ${h.y}px)`;
-            dot.classList.toggle("pinch", h.pinching);
-            // an open hand near a shelf tile marks it as the candidate (magnetic)
-            if (!hover) {
-              const hit = scene.hitPanel(h.x, h.y);
-              hover = hit && !hit.focused ? hit.id : scene.nearestShelfPanel(h.x, h.y);
-            }
-          }
+        for (const h of steering) {
+          // an open hand near a shelf tile marks it as the candidate (magnetic)
+          const hit = scene.hitPanel(h.x, h.y);
+          hover = hit && !hit.focused ? hit.id : scene.nearestShelfPanel(h.x, h.y);
+          if (hover) break;
         }
         claimHighlight("hand", hover);
       },
+      onMeeting: (m) => {
+        renderMeeting(m);
+        if (m.holder !== floorHolder) {
+          // the talking stick changed hands — a short rising chirp
+          if (m.holder !== null && settings.handGestures) {
+            sound?.ping(1320, 0.06);
+            // Octa made its pick — name the person, but never talk over a turn
+            if (state === "idle") announce(`P${m.holder}, værsågod.`);
+          }
+          floorHolder = m.holder;
+          // have compliments ready for the new holder before they ask anything
+          if (m.holder !== null) setTimeout(refreshCompliments, 1500);
+        }
+      },
     });
-    announce("Gesture control online.");
+    announce("Gestestyring er på.");
     setTimeout(refreshCompliments, 5000);
   } catch (err) {
     gestures = null;
     settings.handGestures = false;
     handsCheck.checked = false;
-    showTranscript("camera unavailable — gestures off");
+    showTranscript("kameraet er utilgjengelig — gester av");
     console.error(err);
   }
 }
@@ -907,6 +1175,8 @@ function disableHandGestures() {
   gestures = null;
   scene.setHeadPosition(0, 0, 0); // ease the parallax camera back to center
   for (const dot of handDots) dot.classList.remove("visible", "pinch");
+  floorHolder = null;
+  renderMeeting({ holder: null, queue: [], persons: [] });
 }
 
 canvas.addEventListener(
@@ -934,6 +1204,10 @@ addEventListener("keydown", (e) => {
     showTranscript("");
     return;
   }
+  if (e.code === "KeyC" && !(document.activeElement instanceof HTMLInputElement)) {
+    setCamView(!camCheck.checked);
+    return;
+  }
   if (e.code !== "Space") return;
   if (document.activeElement instanceof HTMLInputElement) return;
   e.preventDefault();
@@ -944,9 +1218,20 @@ addEventListener("keydown", (e) => {
 Object.assign(window, {
   octa: {
     scene, agentEvents, setState, presentArtifacts, salvageVisualFromText, visualsEl,
+    jevLog, jevLogCsv, checkAddressee, converse, setTier,
+    // for scripted runs: patch Recognizer.prototype / speaker to feed text in
+    Recognizer, speaker,
+    previewParticipants: (v: ParticipantView | null) => (participantsPreview = v),
+    get state() { return state; },
+    get tier() { return settings.tier; },
     get sound() { return sound; },
   },
 });
+
+const participantsEl = document.querySelector<HTMLDivElement>("#participants")!;
+let participantsAt = 0;
+// set from the console (octa.previewParticipants) to style the strip without a camera
+let participantsPreview: ParticipantView | null = null;
 
 function frame() {
   speakLevel *= 0.94;
@@ -958,6 +1243,16 @@ function frame() {
         : 0;
 
   scene.render();
+  drawCamView();
+  // participant tiles: 10 updates a second is plenty for gaze and hands
+  const now = performance.now();
+  if (now - participantsAt > 100) {
+    participantsAt = now;
+    renderParticipants(
+      participantsEl,
+      participantsPreview ?? (gestures && settings.handGestures ? gestures.snapshot() : null)
+    );
+  }
   const m = scene.getMotion();
   sound?.update(m.angularSpeed, m.level);
 
