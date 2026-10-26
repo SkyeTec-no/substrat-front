@@ -72,6 +72,9 @@ export const settings = {
   },
   set voiceStyle(v: VoiceStyle) { localStorage.setItem("octa-voice-style", v); },
   get robotVoice() { return this.voiceStyle !== "plain"; },
+  /** In a meeting, start listening when the floor holder looks at Octa and talks. */
+  get autoListen() { return localStorage.getItem("octa-auto-listen") !== "0"; },
+  set autoListen(v: boolean) { localStorage.setItem("octa-auto-listen", v ? "1" : "0"); },
   get handGestures() { return localStorage.getItem("octa-hand-gestures") === "1"; },
   set handGestures(v: boolean) { localStorage.setItem("octa-hand-gestures", v ? "1" : "0"); },
 };

@@ -1,4 +1,4 @@
-import { FilesetResolver, GestureRecognizer, FaceLandmarker } from "@mediapipe/tasks-vision";
+import { FilesetResolver, GestureRecognizer, FaceLandmarker, PoseLandmarker } from "@mediapipe/tasks-vision";
 import { Floor, type FloorState } from "./floor";
 
 /**
@@ -57,13 +57,17 @@ export interface GestureEvents {
   onHead?: (nx: number, ny: number, size: number) => void;
   /** Who is in view, who holds the floor, who is waiting. */
   onMeeting?: (s: MeetingState) => void;
+  /** The floor holder started talking while facing Octa — time to listen. */
+  onHolderTalk?: (person: number) => void;
 }
 
 const PINCH_ON = 0.38; // thumb-index distance / hand size — with hysteresis
 const PINCH_OFF = 0.52;
 
 const MAX_HANDS = 8;
-const PERSON_TTL = 2500; // ms a face may go unseen before the person is dropped
+const PERSON_TTL = 2500; // ms a person may go unseen before they're dropped
+const CROP = 256; // face crops are analysed at this size (px, square)
+const FACE_FRESH = 500; // ms a face-mesh read stays the authority on gaze
 const HAND_TTL = 300; // ms a hand track survives a missed frame
 const RAISE_HOLD = 1000; // ms a hand must stay above the head to count
 const BIND_MAX = 4.5; // max hand-to-face distance, in face widths
@@ -84,13 +88,18 @@ const GAZE_IRIS = 0.2; // irises off-center in their eyes by more than this → 
 
 interface Person {
   id: number;
-  cx: number; // face center, video px
+  cx: number; // head center, video px
   cy: number;
-  w: number; // face box size, video px
+  w: number; // head box size, video px
   h: number;
   top: number;
   ears: { x: number; y: number }[]; // normalized video coords
+  wrists: { x: number; y: number }[]; // visible wrists from the body pose, video px
   lastSeen: number;
+  poseFacing: boolean; // head turned to the camera, judged from the body pose
+  faceAt: number; // last time the face mesh read this person's face
+  raiseSince: number; // wrist above the head (from the pose), held
+  raiseFired: boolean;
   /** Lip gap / face height per face frame, with whether the lips were moving
    *  and the face was turned to Octa then. */
   mouth: { t: number; gap: number; moving: boolean; looking: boolean }[];
@@ -224,6 +233,15 @@ export async function captureCameraFrame(
 export class GestureControl {
   private recognizer: GestureRecognizer | null = null;
   private faceLandmarker: FaceLandmarker | null = null;
+  private poseLandmarker: PoseLandmarker | null = null;
+  private crop: HTMLCanvasElement | null = null;
+  private cropTurn = 0; // round-robin over people for face crops
+  // The pose model shrinks its input to ~256 px, so on a whole 16:9 room frame
+  // people at the far end vanish. It runs on overlapping tiles instead (3×2
+  // plus the full frame), two tiles per pose frame, a full sweep every ~0.25 s.
+  private tiles: { x: number; y: number; w: number; h: number }[] = [];
+  private tileCanvas: HTMLCanvasElement | null = null;
+  private tileTurn = 0;
   private video: HTMLVideoElement | null = null;
   private stream: MediaStream | null = null;
   private running = false;
@@ -252,8 +270,11 @@ export class GestureControl {
   private frameCount = 0;
   private earSince = 0;
   private earFired = false;
+  private talkSince = 0; // floor holder: lips moving while facing Octa since…
+  private talkFired = false;
 
-  async start(events: GestureEvents) {
+  /** cameraId: a meeting-room camera from the device list ("" = default). */
+  async start(events: GestureEvents, cameraId = "") {
     const fileset = await FilesetResolver.forVisionTasks("/mediapipe-wasm");
     this.recognizer = await GestureRecognizer.createFromOptions(fileset, {
       baseOptions: {
@@ -263,19 +284,40 @@ export class GestureControl {
       runningMode: "VIDEO",
       numHands: MAX_HANDS,
     });
+    // People are found by body pose — it sees a whole person across a meeting
+    // room, where the face detector gives up beyond ~2 m. Each head is then
+    // cropped from the full-resolution frame, enlarged, and read by the face
+    // mesh for lips and gaze.
+    this.poseLandmarker = await PoseLandmarker.createFromOptions(fileset, {
+      baseOptions: {
+        modelAssetPath: "/models/pose_landmarker_lite.task",
+        delegate: "GPU",
+      },
+      // IMAGE mode: it runs on tiles of the frame, not one continuous stream
+      runningMode: "IMAGE",
+      numPoses: MAX_FACES,
+      minPoseDetectionConfidence: 0.3,
+      minPosePresenceConfidence: 0.3,
+    });
     this.faceLandmarker = await FaceLandmarker.createFromOptions(fileset, {
       baseOptions: {
         modelAssetPath: "/models/face_landmarker.task",
         delegate: "GPU",
       },
-      runningMode: "VIDEO",
-      numFaces: MAX_FACES,
-      minFaceDetectionConfidence: 0.4,
+      runningMode: "IMAGE",
+      numFaces: 1,
+      minFaceDetectionConfidence: 0.25,
+      minFacePresenceConfidence: 0.25,
     });
+    this.crop = document.createElement("canvas");
+    this.crop.width = this.crop.height = CROP;
 
-    // wider frame: a meeting room has people at the edges, not just one face in the middle
+    // as many pixels as the camera gives (room cameras do 1080p): people at the
+    // back of the room are small, and every pixel helps the detectors find them
     this.stream = await navigator.mediaDevices.getUserMedia({
-      video: { width: 1280, height: 720, facingMode: "user" },
+      video: cameraId
+        ? { deviceId: { exact: cameraId }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+        : { width: { ideal: 1920 }, height: { ideal: 1080 }, facingMode: "user" },
     });
     const video = document.createElement("video");
     video.playsInline = true;
@@ -308,10 +350,10 @@ export class GestureControl {
       queue: [...(this.floor?.queue ?? [])],
       persons: this.persons.map((p) => ({
         id: p.id, x: p.cx - p.w / 2, y: p.cy - p.h / 2, w: p.w, h: p.h,
-        talking: !!p.mouth.at(-1)?.moving && performance.now() - p.lastSeen < 400,
-        looking: p.looking && performance.now() - p.lastSeen < 400,
+        talking: !!p.mouth.at(-1)?.moving && performance.now() - (p.mouth.at(-1)?.t ?? 0) < 400,
+        looking: p.looking && performance.now() - p.lastSeen < 1000,
         // a hand of theirs is above their head right now (asking for the floor)
-        handUp: this.tracks.some((t) => t.owner === p.id && t.raiseSince > 0),
+        handUp: p.raiseSince > 0 || this.tracks.some((t) => t.owner === p.id && t.raiseSince > 0),
       })),
       hands: this.tracks.map((t) => ({ x: t.wx, y: t.wy, owner: t.owner, raised: t.raiseSince > 0 })),
     };
@@ -357,8 +399,10 @@ export class GestureControl {
     this.stream?.getTracks().forEach((t) => t.stop());
     this.recognizer?.close();
     this.faceLandmarker?.close();
+    this.poseLandmarker?.close();
     this.recognizer = null;
     this.faceLandmarker = null;
+    this.poseLandmarker = null;
     this.video = null;
     this.stream = null;
     this.floor = null;
@@ -368,67 +412,174 @@ export class GestureControl {
     this.lastMid = this.lastSpread = this.lastPinchSize = null;
   }
 
-  /** Match this frame's faces to known persons (nearest center), minting new ones. */
+  /** Find people by body pose, match them to known persons, and read a couple
+   *  of faces (the floor holder always) from enlarged crops. */
   private updatePersons(now: number, vw: number, vh: number) {
-    const faces = this.faceLandmarker!.detectForVideo(this.video!, now).faceLandmarks;
-    const free = new Set(this.persons);
-    for (const lm of faces) {
-      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-      for (const l of lm) {
-        x0 = Math.min(x0, l.x); x1 = Math.max(x1, l.x);
-        y0 = Math.min(y0, l.y); y1 = Math.max(y1, l.y);
-      }
-      const b = { originX: x0 * vw, originY: y0 * vh, width: (x1 - x0) * vw, height: (y1 - y0) * vh };
-      const cx = b.originX + b.width / 2;
-      const cy = b.originY + b.height / 2;
-      let best: Person | null = null;
-      let bestDist = Infinity;
-      for (const p of free) {
-        const dist = Math.hypot(p.cx - cx, p.cy - cy);
-        if (dist < Math.max(p.w, b.width) * 0.9 && dist < bestDist) {
-          best = p;
-          bestDist = dist;
+    if (!this.tiles.length || this.tiles[0].w !== vw || this.tiles[0].h !== vh) {
+      const tiles = [{ x: 0, y: 0, w: vw, h: vh }];
+      const cols = 3;
+      const rows = 2;
+      const tw = Math.round((vw / cols) * 1.35);
+      const th = Math.round((vh / rows) * 1.35);
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          const x = Math.round(Math.min(vw - tw, Math.max(0, ((c + 0.5) * vw) / cols - tw / 2)));
+          const y = Math.round(Math.min(vh - th, Math.max(0, ((r + 0.5) * vh) / rows - th / 2)));
+          tiles.push({ x, y, w: tw, h: th });
         }
       }
-      // 234 / 454 are the face-contour points beside the ears
-      const ears = [lm[234], lm[454]].map((k) => ({ x: k.x, y: k.y }));
-      // inner-lip gap (13 upper, 14 lower) over forehead-to-chin (10, 152)
-      const faceH = Math.hypot((lm[10].x - lm[152].x) * vw, (lm[10].y - lm[152].y) * vh) || 1;
-      const gap = Math.hypot((lm[13].x - lm[14].x) * vw, (lm[13].y - lm[14].y) * vh) / faceH;
-      if (best) {
-        free.delete(best);
-        best.cx += (cx - best.cx) * 0.5;
-        best.cy += (cy - best.cy) * 0.5;
-        best.w += (b.width - best.w) * 0.5;
-        best.h += (b.height - best.h) * 0.5;
-        best.top = b.originY;
-        best.ears = ears;
-        best.lastSeen = now;
-      } else {
-        best = {
-          id: this.nextPersonId++,
-          cx, cy, w: b.width, h: b.height, top: b.originY, ears, lastSeen: now, mouth: [],
-          lookEma: 0, looking: false,
-        };
-        this.persons.push(best);
+      this.tiles = tiles;
+      this.tileCanvas ??= document.createElement("canvas");
+    }
+    for (let k = 0; k < 2; k++) {
+      const tile = this.tiles[this.tileTurn++ % this.tiles.length];
+      const cv = this.tileCanvas!;
+      if (cv.width !== tile.w || cv.height !== tile.h) {
+        cv.width = tile.w;
+        cv.height = tile.h;
       }
-      // speech = lips opening and closing, not just an open mouth
-      const recent = best.mouth.filter((m) => now - m.t < MOUTH_WINDOW).map((m) => m.gap);
-      recent.push(gap);
-      const moving = Math.max(...recent) - Math.min(...recent) > MOUTH_MOVING;
-      // facing Octa: head turned to the camera and eyes not cut to the side
-      best.lookEma += ((facing(lm) ? 1 : 0) - best.lookEma) * 0.35;
-      best.looking = best.lookEma > (best.looking ? 0.35 : 0.65); // hysteresis
-      best.mouth.push({ t: now, gap, moving, looking: best.looking });
-      while (best.mouth.length && now - best.mouth[0].t > MOUTH_LOG_MS) best.mouth.shift();
+      cv.getContext("2d")!.drawImage(this.video!, tile.x, tile.y, tile.w, tile.h, 0, 0, tile.w, tile.h);
+      for (const lm of this.poseLandmarker!.detect(cv).landmarks) {
+        this.seePose(
+          lm.map((l) => ({ x: tile.x + l.x * tile.w, y: tile.y + l.y * tile.h, v: l.visibility ?? 1 })),
+          now,
+          vw,
+          vh
+        );
+      }
     }
     this.persons = this.persons.filter((p) => now - p.lastSeen < PERSON_TTL);
+
+    // face crops: the floor holder every time (their lips gate speech), plus
+    // one other person in turn
+    const holder = this.persons.find((p) => p.id === this.floor?.holder);
+    // (a person is re-seen once per tile sweep, ~0.25 s — "recent" means within 1 s)
+    const others = this.persons.filter((p) => p !== holder && now - p.lastSeen < 1000);
+    const pick = others.length ? others[this.cropTurn++ % others.length] : undefined;
+    for (const p of [holder, pick]) if (p && now - p.lastSeen < 1000) this.readFace(p, now);
+  }
+
+  /** One detected body (landmarks in video px): match it to a person and update them. */
+  private seePose(pts: { x: number; y: number; v: number }[], now: number, vw: number, vh: number) {
+    const vis = (i: number) => (pts[i]?.v ?? 0) > 0.5;
+    const dist = (a: number, b: number) => Math.hypot(pts[a].x - pts[b].x, pts[a].y - pts[b].y);
+    // 0 nose · 2/5 eyes · 7/8 ears · 11/12 shoulders · 15/16 wrists
+    const face = [0, 2, 5].filter(vis);
+    const head = face.length ? face : [7, 8].filter(vis);
+    if (!head.length) return;
+    const cx = head.reduce((a, i) => a + pts[i].x, 0) / head.length;
+    const cy = head.reduce((a, i) => a + pts[i].y, 0) / head.length;
+    const w = Math.max(
+      vis(7) && vis(8) ? dist(7, 8) * 1.25 : 0,
+      vis(2) && vis(5) ? dist(2, 5) * 2.4 : 0,
+      vis(11) && vis(12) ? dist(11, 12) * 0.42 : 0,
+      24
+    );
+    const h = w * 1.3;
+    // facing the camera: nose centred between both visible ears
+    let poseFacing = false;
+    if (vis(0) && vis(7) && vis(8)) {
+      const yaw = (pts[0].x - (pts[7].x + pts[8].x) / 2) / Math.max(1, dist(7, 8));
+      poseFacing = Math.abs(yaw) < 0.2;
+    }
+    const ears = [7, 8].filter(vis).map((i) => ({ x: pts[i].x / vw, y: pts[i].y / vh }));
+    const wrists = [15, 16].filter(vis).map((i) => ({ x: pts[i].x, y: pts[i].y }));
+
+    // overlapping tiles see the same person twice — nearest known head wins
+    let best: Person | null = null;
+    let bestDist = Infinity;
+    for (const p of this.persons) {
+      const d = Math.hypot(p.cx - cx, p.cy - cy);
+      if (d < Math.max(p.w, w) * 1.2 && d < bestDist) {
+        best = p;
+        bestDist = d;
+      }
+    }
+    if (best) {
+      best.cx += (cx - best.cx) * 0.5;
+      best.cy += (cy - best.cy) * 0.5;
+      best.w += (w - best.w) * 0.5;
+      best.h += (h - best.h) * 0.5;
+    } else {
+      best = {
+        id: this.nextPersonId++, cx, cy, w, h, top: 0, ears, wrists, lastSeen: now,
+        poseFacing, faceAt: 0, raiseSince: 0, raiseFired: false,
+        mouth: [], lookEma: 0, looking: false,
+      };
+      this.persons.push(best);
+    }
+    best.top = best.cy - best.h * 0.55;
+    if (ears.length) best.ears = ears;
+    best.wrists = wrists;
+    best.poseFacing = poseFacing;
+    best.lastSeen = now;
+    // without a fresh face read, gaze comes from head pose
+    if (now - best.faceAt > FACE_FRESH) this.updateLook(best, poseFacing);
+
+    // raise-to-speak from the pose: a wrist above the head, held
+    const up = wrists.some((wr) => wr.y < best.top);
+    if (!up) {
+      best.raiseSince = 0;
+      best.raiseFired = false;
+    } else {
+      if (!best.raiseSince) best.raiseSince = now;
+      if (!best.raiseFired && now - best.raiseSince > RAISE_HOLD) {
+        best.raiseFired = true;
+        this.floor?.raise(best.id);
+      }
+    }
+  }
+
+  private updateLook(p: Person, facingNow: boolean) {
+    p.lookEma += ((facingNow ? 1 : 0) - p.lookEma) * 0.35;
+    p.looking = p.lookEma > (p.looking ? 0.35 : 0.65); // hysteresis
+  }
+
+  /** Enlarge one head from the full-res frame and read lips + gaze from the mesh. */
+  private readFace(p: Person, now: number) {
+    const video = this.video!;
+    // generous crop: far heads are only ~30 px wide, and the mesh needs context
+    const side = Math.max(p.w * 3, 96);
+    const sx = Math.max(0, Math.min(video.videoWidth - side, p.cx - side / 2));
+    const sy = Math.max(0, Math.min(video.videoHeight - side, p.cy - side / 2));
+    const ctx = this.crop!.getContext("2d")!;
+    ctx.drawImage(video, sx, sy, side, side, 0, 0, CROP, CROP);
+    const lm = this.faceLandmarker!.detect(this.crop!).faceLandmarks[0];
+    if (!lm) return; // too small or turned away — pose keeps the gaze estimate
+    p.faceAt = now;
+    // inner-lip gap (13 upper, 14 lower) over forehead-to-chin (10, 152); the
+    // crop is square, so normalized coordinates keep their proportions
+    const faceH = Math.hypot(lm[10].x - lm[152].x, lm[10].y - lm[152].y) || 1;
+    const gap = Math.hypot(lm[13].x - lm[14].x, lm[13].y - lm[14].y) / faceH;
+    // speech = lips opening and closing, not just an open mouth
+    const recent = p.mouth.filter((m) => now - m.t < MOUTH_WINDOW).map((m) => m.gap);
+    recent.push(gap);
+    const moving = Math.max(...recent) - Math.min(...recent) > MOUTH_MOVING;
+    this.updateLook(p, facing(lm));
+    p.mouth.push({ t: now, gap, moving, looking: p.looking });
+    while (p.mouth.length && now - p.mouth[0].t > MOUTH_LOG_MS) p.mouth.shift();
   }
 
   /** Which person does a wrist belong to? Hands hang below and beside the face,
    *  so distance below counts half. Sticky: the current owner keeps the hand
    *  unless someone else is clearly closer. */
   private bindHand(t: HandTrack) {
+    // best evidence: the body pose puts one of this person's wrists right here
+    let byPose: Person | null = null;
+    let byPoseDist = Infinity;
+    for (const p of this.persons) {
+      for (const wr of p.wrists) {
+        const d = Math.hypot(wr.x - t.wx, wr.y - t.wy);
+        if (d < Math.max(p.w * 1.2, 50) && d < byPoseDist) {
+          byPose = p;
+          byPoseDist = d;
+        }
+      }
+    }
+    if (byPose) {
+      t.owner = byPose.id;
+      return;
+    }
     const cost = (p: Person) => {
       const dx = (t.wx - p.cx) / p.w;
       const dy = (t.wy - p.cy) / p.w;
@@ -455,8 +606,8 @@ export class GestureControl {
     const vh = this.video.videoHeight || 720;
     const res = this.recognizer.recognizeForVideo(this.video, now);
 
-    // every 2nd frame: faces move slowly, but lips need ~20+ samples a second
-    const faceFrame = this.faceLandmarker && this.frameCount++ % 2 === 0;
+    // every 2nd frame: people move slowly, but lips need ~15+ samples a second
+    const faceFrame = this.poseLandmarker && this.frameCount++ % 2 === 0;
     if (faceFrame) {
       this.updatePersons(now, vw, vh);
       const ids = this.persons.map((p) => p.id);
@@ -610,11 +761,26 @@ export class GestureControl {
       now
     );
 
+    // talk-to-listen: the holder faces Octa and their lips move for a beat
+    const last = holderPerson?.mouth.at(-1);
+    const talkingToOcta = !!holderPerson && holderPerson.looking && !!last?.moving && now - last.t < 200;
+    if (talkingToOcta) {
+      if (!this.talkSince) this.talkSince = now;
+      if (!this.talkFired && now - this.talkSince > 250) {
+        this.talkFired = true;
+        events.onHolderTalk?.(holderPerson!.id);
+      }
+    } else if (now - (last?.t ?? 0) > 1500 || !holderPerson?.looking) {
+      // a pause or a look away re-arms it for the next thing they say
+      this.talkSince = 0;
+      this.talkFired = false;
+    }
+
     // parallax follows whoever holds the floor (else the nearest face)
     if (faceFrame) {
       const head =
         holderPerson ?? [...this.persons].sort((a, b) => b.w - a.w)[0];
-      if (head && now - head.lastSeen < 400) {
+      if (head && now - head.lastSeen < 1000) {
         events.onHead?.(0.5 - head.cx / vw, head.cy / vh - 0.42, head.w / vw);
       } else {
         events.onHead?.(0, 0, 0); // face lost — drift back to center

@@ -1,7 +1,8 @@
 import "./style.css";
 import { OctaScene, type OctaState } from "./scene";
 import { Soundscape } from "./sound";
-import { MicMeter, Recognizer, Speaker } from "./speech";
+import { MicMeter, Recognizer, CloudRecognizer, Speaker, type SpeechCapture } from "./speech";
+import { deviceSettings, fillDeviceSelect, routeOutput } from "./devices";
 import { think } from "./brain";
 import { settings, listModels, type ChatResult, type ModelTier, type VoiceStyle } from "./openrouter";
 import { respond, keynote, repairMermaid, generateReport, generateCompliments, generateCommentary } from "./agents";
@@ -30,6 +31,8 @@ initTheme();
 scene.setTheme(theme());
 onThemeChange((t) => scene.setTheme(t));
 const speaker = new Speaker();
+// the Vader voice plays wherever the meeting-room speaker is
+speaker.vader.onContext = (ctx) => void routeOutput(ctx);
 speaker.onStartFx = () => sound?.robotStart();
 speaker.onWordFx = () => sound?.robotWord();
 speaker.onEndFx = () => sound?.robotStop();
@@ -42,11 +45,37 @@ let state: OctaState = "idle";
 let speakLevel = 0; // synthetic envelope while TTS plays (its audio isn't tappable)
 
 function setState(next: OctaState) {
+  const prev = state;
   state = next;
   scene.setState(next);
   sound?.setState(next);
-  statusEl.textContent = next;
+  // earcons: a rising blip when the mic opens, a falling one when it closes —
+  // in a meeting everyone should hear when Octa is (and stops) listening
+  if (next === "listening" && prev !== "listening") sound?.ping(1568, 0.07);
+  if (prev === "listening" && next !== "listening") sound?.ping(784, 0.05);
   statusEl.className = next;
+  renderStatus();
+}
+
+/** The line under the orb: what Octa is doing, and in a meeting, with whom. */
+function renderStatus() {
+  const who = floorHolder !== null ? `P${floorHolder}` : null;
+  const meeting = !!gestures && settings.handGestures;
+  const text =
+    state === "listening"
+      ? who ? `lytter til ${who}` : "lytter"
+      : state === "thinking"
+        ? "tenker"
+        : state === "speaking"
+          ? "snakker"
+          : state === "noting"
+            ? "tar notater"
+            : meeting && who
+              ? `${who} har ordet · se på Octa og snakk`
+              : meeting && meetingPersons > 0
+                ? "rekk opp hånden for ordet"
+                : "klar";
+  if (statusEl.textContent !== text) statusEl.textContent = text;
 }
 
 function showTranscript(text: string, interim = false) {
@@ -381,7 +410,7 @@ function speakable(text: string): string {
 
 let noteMode = false;
 let noteLines: string[] = [];
-let noteRec: Recognizer | null = null;
+let noteRec: SpeechCapture | null = null;
 
 function enterNoteMode() {
   if (noteMode) return;
@@ -402,7 +431,7 @@ const SELF_ECHO = /note ?taker (online|off)|cross your hands|notes stored|notatm
 
 function noteLoop() {
   if (!noteMode) return;
-  const rec = new Recognizer();
+  const rec = createRecognizer();
   noteRec = rec;
   rec.onInterim = (t) => showTranscript(t, true);
   rec.onFinal = (t) => {
@@ -454,7 +483,13 @@ function exitNoteMode() {
 // --- conversation loop ------------------------------------------------------
 
 let turnId = 0;
-let activeRec: Recognizer | null = null;
+let activeRec: SpeechCapture | null = null;
+
+/** Chrome's recognizer only hears the system default mic; with a meeting-room
+ *  mic chosen, capture that mic and transcribe in the cloud instead. */
+function createRecognizer(): SpeechCapture {
+  return deviceSettings.micId && settings.key ? new CloudRecognizer(mic) : new Recognizer();
+}
 let lastResult: ChatResult | null = null; // artifacts "download it" refers to
 let lastSvgMarkup: string | null = null; // rendered mermaid, for SVG download
 
@@ -484,7 +519,7 @@ async function converse() {
   showTranscript("");
   // artifacts stay on screen while listening — "download it" needs them
 
-  const rec = new Recognizer();
+  const rec = createRecognizer();
   activeRec = rec;
   const listenSince = performance.now();
   const heard = await new Promise<string | null>((resolve) => {
@@ -716,6 +751,7 @@ async function converse() {
 
   // spoken fillers while the LLM round-trip is in flight — same low-latency TTS
   let fillerCount = 0;
+  let asides = 0;
   let fillerTimer = 0;
   const scheduleFiller = (delay: number) => {
     fillerTimer = window.setTimeout(() => {
@@ -725,8 +761,12 @@ async function converse() {
         // Octa's own commentary on the topic as soon as it's written (a stored
         // filler covers the gap until then), with a compliment for whoever has
         // the floor slipped in every third beat
+        // concise in a meeting: one aside with people around, two when alone;
+        // past that, only a short filler on long waits
+        const maxAsides = meetingPersons > 1 ? 1 : 2;
         const compliment = fillerCount > 0 && fillerCount % 3 === 2 ? takeCompliment() : undefined;
-        const remark = compliment ? undefined : commentary.shift();
+        const remark = compliment || asides >= maxAsides ? undefined : commentary.shift();
+        if (remark) asides++;
         const line = remark ?? compliment ?? FILLERS[Math.min(fillerCount, FILLERS.length - 1)];
         if (remark) showTranscript(remark, true); // the aside shows, dimmed, under the orb
         fillerCount++;
@@ -832,11 +872,50 @@ const jevModeSelect = document.querySelector<HTMLSelectElement>("#jev-mode")!;
 jevModeSelect.value = jevSettings.mode;
 jevModeSelect.addEventListener("change", () => (jevSettings.mode = jevModeSelect.value as JevMode));
 
+// --- meeting-room hardware --------------------------------------------------
+
+const cameraSelect = document.querySelector<HTMLSelectElement>("#dev-camera")!;
+const micSelect = document.querySelector<HTMLSelectElement>("#dev-mic")!;
+const speakerSelect = document.querySelector<HTMLSelectElement>("#dev-speaker")!;
+
+async function refreshDeviceLists() {
+  await fillDeviceSelect(cameraSelect, "videoinput", deviceSettings.cameraId);
+  await fillDeviceSelect(micSelect, "audioinput", deviceSettings.micId);
+  await fillDeviceSelect(speakerSelect, "audiooutput", deviceSettings.speakerId);
+}
+navigator.mediaDevices?.addEventListener("devicechange", () => void refreshDeviceLists());
+
+cameraSelect.addEventListener("change", async () => {
+  deviceSettings.cameraId = cameraSelect.value;
+  if (gestures) {
+    // reopen the camera on the new device
+    disableHandGestures();
+    await enableHandGestures();
+  }
+});
+micSelect.addEventListener("change", async () => {
+  deviceSettings.micId = micSelect.value;
+  try {
+    await mic.init(deviceSettings.micId);
+  } catch {
+    showTranscript("fikk ikke åpnet mikrofonen");
+  }
+});
+speakerSelect.addEventListener("change", () => {
+  deviceSettings.speakerId = speakerSelect.value;
+  void routeOutput(sound?.context ?? null);
+  void routeOutput(speaker.vader.context);
+});
+
 const darkCheck = document.querySelector<HTMLInputElement>("#or-dark")!;
 darkCheck.checked = theme().dark;
 darkCheck.addEventListener("change", () => setDarkMode(darkCheck.checked));
 
 // --- camera view: what the gesture camera sees, with faces and hands marked --
+
+const autoListenCheck = document.querySelector<HTMLInputElement>("#or-auto-listen")!;
+autoListenCheck.checked = settings.autoListen;
+autoListenCheck.addEventListener("change", () => (settings.autoListen = autoListenCheck.checked));
 
 const camCheck = document.querySelector<HTMLInputElement>("#or-camview")!;
 const camView = document.querySelector<HTMLCanvasElement>("#camview")!;
@@ -941,6 +1020,7 @@ agentsCheck.checked = settings.agentsEnabled;
 let modelsLoaded = false;
 settingsBtn.addEventListener("click", async () => {
   settingsPanel.classList.toggle("hidden");
+  if (!settingsPanel.classList.contains("hidden")) void refreshDeviceLists();
   if (!modelsLoaded && !settingsPanel.classList.contains("hidden")) {
     modelsLoaded = true;
     try {
@@ -980,9 +1060,10 @@ startBtn.addEventListener("click", async () => {
 
   sound = new Soundscape();
   await sound.start();
+  void routeOutput(sound.context);
 
   try {
-    await mic.init();
+    await mic.init(deviceSettings.micId);
   } catch {
     showTranscript("mikrofonen er utilgjengelig — bare visuelt");
   }
@@ -1112,10 +1193,10 @@ function renderMeeting(m: MeetingState) {
     el.textContent = text;
     return el;
   };
-  meetingEl.append(label("floor"));
-  meetingEl.append(m.holder !== null ? chip(m.holder, "holder") : label("— raise a hand"));
+  meetingEl.append(label("ordet"));
+  meetingEl.append(m.holder !== null ? chip(m.holder, "holder") : label("— rekk opp hånden"));
   if (m.queue.length) {
-    meetingEl.append(label("next"));
+    meetingEl.append(label("neste"));
     for (const id of m.queue) meetingEl.append(chip(id, "queued"));
   }
 }
@@ -1123,6 +1204,7 @@ function renderMeeting(m: MeetingState) {
 let gestures: GestureControl | null = null;
 let wasPinching = false;
 let floorHolder: number | null = null;
+let meetingPersons = 0;
 
 // One mediator for highlight focus: hand hover beats mouse hover.
 // Each source only releases its own claim.
@@ -1140,7 +1222,8 @@ async function enableHandGestures() {
   if (gestures) return;
   gestures = new GestureControl();
   try {
-    await gestures.start({
+    await gestures.start(
+      {
       onPan: (dx, dy) => {
         if (!settings.handGestures) return;
         const id = scene.focusedPanelId();
@@ -1210,8 +1293,15 @@ async function enableHandGestures() {
         }
         claimHighlight("hand", hover);
       },
+      onHolderTalk: () => {
+        // talk-to-listen: the floor holder faces Octa and starts speaking
+        if (!settings.handGestures || !settings.autoListen) return;
+        if (state !== "idle" || speaker.speaking || noteMode) return;
+        converse();
+      },
       onMeeting: (m) => {
         renderMeeting(m);
+        meetingPersons = m.persons.length;
         if (m.holder !== floorHolder) {
           // the talking stick changed hands — a short rising chirp
           if (m.holder !== null && settings.handGestures) {
@@ -1220,11 +1310,14 @@ async function enableHandGestures() {
             if (state === "idle") announce(`P${m.holder}, værsågod.`);
           }
           floorHolder = m.holder;
+          renderStatus();
           // have compliments ready for the new holder before they ask anything
           if (m.holder !== null) setTimeout(refreshCompliments, 1500);
         }
       },
-    });
+      },
+      deviceSettings.cameraId
+    );
     announce("Gestestyring er på.");
     setTimeout(refreshCompliments, 5000);
   } catch (err) {
@@ -1346,10 +1439,9 @@ function frame() {
   }
   if (now - participantsAt > 100) {
     participantsAt = now;
-    renderParticipants(
-      participantsEl,
-      participantsPreview ?? (gestures && settings.handGestures ? gestures.snapshot() : null)
-    );
+    const view = participantsPreview ?? (gestures && settings.handGestures ? gestures.snapshot() : null);
+    renderParticipants(participantsEl, view && { ...view, listening: state === "listening" });
+    renderStatus();
   }
   const m = scene.getMotion();
   sound?.update(m.angularSpeed, m.level);

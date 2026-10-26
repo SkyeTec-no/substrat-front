@@ -25,6 +25,18 @@
     <button id="settings-btn" title="settings">⚙</button>
     <div id="settings" class="hidden">
       <label>
+        Camera
+        <select id="dev-camera"></select>
+      </label>
+      <label>
+        Microphone <small>(a chosen mic is transcribed in the cloud)</small>
+        <select id="dev-mic"></select>
+      </label>
+      <label>
+        Speaker
+        <select id="dev-speaker"></select>
+      </label>
+      <label>
         OpenRouter API key
         <input id="or-key" type="password" placeholder="sk-or-…" autocomplete="off" />
       </label>
@@ -69,6 +81,10 @@
       <label class="row">
         <input type="checkbox" id="or-hands" />
         camera hand gestures
+      </label>
+      <label class="row">
+        <input type="checkbox" id="or-auto-listen" />
+        listen when the floor holder looks at Octa and talks
       </label>
       <label class="row">
         <input type="checkbox" id="or-camview" />

@@ -189,6 +189,12 @@ const faithful = (text: string, r: { transcript: string; cut: boolean }) =>
 
 export class VaderVoice {
   private ctx: AudioContext | null = null;
+  get context(): AudioContext | null {
+    return this.ctx;
+  }
+
+  /** Called with each new AudioContext, so the app can route it to the chosen speaker. */
+  onContext: (ctx: AudioContext) => void = () => {};
   private input: GainNode | null = null;
   private crushIn: GainNode | null = null; // same chain, but through a bitcrusher first
   private room: GainNode | null = null; // reverb send
@@ -259,6 +265,7 @@ export class VaderVoice {
     out.connect(room);
 
     this.ctx = ctx;
+    this.onContext(ctx);
     this.input = input;
     this.crushIn = crushIn;
     this.room = room;

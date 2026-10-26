@@ -7,6 +7,8 @@
 
 export interface ParticipantView {
   holder: number | null;
+  /** Octa is listening right now (to the holder). */
+  listening?: boolean;
   queue: number[];
   persons: { id: number; looking: boolean; talking: boolean; handUp: boolean }[];
 }
@@ -14,6 +16,7 @@ export interface ParticipantView {
 // 24×24 stroke paths, same line language as the slide icons
 const EYE = "M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12Z M12 9a3 3 0 1 0 0 6a3 3 0 1 0 0-6Z";
 const EYE_OFF = "M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12Z M4 4l16 16";
+const MIC = "M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z M5 11a7 7 0 0 0 14 0 M12 18v3";
 const HAND =
   "M8 13V5.5a1.5 1.5 0 0 1 3 0V11 M11 10.5V4a1.5 1.5 0 0 1 3 0v6.5 M14 10.5V5.5a1.5 1.5 0 0 1 3 0V14c0 4-2.6 7-6.2 7-2.5 0-4-1.4-5.4-3.8L3.8 14c-.8-1.3.9-2.6 2-1.6L8 14.5";
 
@@ -30,6 +33,7 @@ function createTile(id: number): HTMLDivElement {
   el.innerHTML = `
     <span class="pt-gaze" title="ser på Octa">${svg(EYE, "on")}${svg(EYE_OFF, "off")}</span>
     <span class="pt-hand" title="hånd oppe">${svg(HAND, "")}</span>
+    <span class="pt-mic" title="Octa lytter">${svg(MIC, "")}</span>
     <span class="pt-num">${id}</span>
     <span class="pt-meter"><i></i><i></i><i></i></span>
     <span class="pt-role"></span>`;
@@ -59,9 +63,10 @@ export function renderParticipants(root: HTMLElement, view: ParticipantView | nu
     el.classList.toggle("hand-up", p.handUp);
     el.classList.toggle("holder", holder);
     el.classList.toggle("queued", queuePos >= 0);
+    el.classList.toggle("listened", holder && !!view!.listening);
 
     const role = el.querySelector<HTMLSpanElement>(".pt-role")!;
-    const roleText = holder ? "ordet" : queuePos >= 0 ? `kø ${queuePos + 1}` : "";
+    const roleText = holder ? (view!.listening ? "lytter" : "ordet") : queuePos >= 0 ? `kø ${queuePos + 1}` : "";
     if (role.textContent !== roleText) role.textContent = roleText;
   }
 

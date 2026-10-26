@@ -22,6 +22,9 @@ const VOICINGS: Record<OctaState, StateVoicing> = {
  */
 export class Soundscape {
   private ctx: AudioContext;
+  get context(): AudioContext {
+    return this.ctx;
+  }
   private master: GainNode;
 
   private oscA: OscillatorNode;

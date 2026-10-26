@@ -475,6 +475,29 @@ body {
 
 .pt.holder .pt-role { color: var(--who); }
 
+/* Octa is listening to this person: mic in the hand's corner, a breathing ring */
+.pt-mic {
+  position: absolute;
+  right: 7px;
+  top: 7px;
+  color: var(--who);
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+.pt.listened .pt-mic { opacity: 1; }
+.pt.listened .pt-hand { opacity: 0; animation: none; }
+
+.pt.listened {
+  animation: pt-listen 1.2s ease-in-out infinite;
+}
+
+/* no outline (the tiles stay frameless) — the fill itself breathes */
+@keyframes pt-listen {
+  0%, 100% { background: color-mix(in srgb, var(--who) 14%, color-mix(in srgb, var(--panel) 80%, transparent)); }
+  50% { background: color-mix(in srgb, var(--who) 34%, color-mix(in srgb, var(--panel) 80%, transparent)); }
+}
+
 #meeting {
   position: fixed;
   top: 1.35rem;

@@ -5,9 +5,27 @@ import { VaderVoice } from "./vader";
 export class MicMeter {
   private analyser: AnalyserNode | null = null;
   private data: Uint8Array<ArrayBuffer> | null = null;
+  private stream: MediaStream | null = null;
+  private ctx: AudioContext | null = null;
+  private tap: ScriptProcessorNode | null = null;
+  /** Last ~1 s of raw mic audio, so a capture can start before it was asked to. */
+  private ring: Float32Array[] = [];
+  private ringLen = 0;
+  /** Live capture sinks (CloudRecognizer) — fed every audio block. */
+  private sinks = new Set<(block: Float32Array) => void>();
 
-  async init(): Promise<void> {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  get sampleRate(): number {
+    return this.ctx?.sampleRate ?? 48000;
+  }
+
+  /** Open the chosen mic ("" = system default). Re-callable to switch devices. */
+  async init(deviceId = ""): Promise<void> {
+    this.close();
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: deviceId
+        ? { deviceId: { exact: deviceId }, echoCancellation: true, noiseSuppression: true }
+        : { echoCancellation: true, noiseSuppression: true },
+    });
     const ctx = new AudioContext();
     const src = ctx.createMediaStreamSource(stream);
     this.analyser = ctx.createAnalyser();
@@ -15,6 +33,50 @@ export class MicMeter {
     this.analyser.smoothingTimeConstant = 0.6;
     src.connect(this.analyser);
     this.data = new Uint8Array(this.analyser.fftSize);
+
+    // raw tap for cloud transcription: keeps a 1 s pre-roll and feeds live captures
+    const tap = ctx.createScriptProcessor(2048, 1, 1);
+    tap.onaudioprocess = (e) => {
+      const block = new Float32Array(e.inputBuffer.getChannelData(0));
+      this.ring.push(block);
+      this.ringLen += block.length;
+      while (this.ringLen - this.ring[0].length > ctx.sampleRate) this.ringLen -= this.ring.shift()!.length;
+      for (const sink of this.sinks) sink(block);
+    };
+    const mute = ctx.createGain();
+    mute.gain.value = 0;
+    src.connect(tap);
+    tap.connect(mute).connect(ctx.destination); // a ScriptProcessor only runs when connected
+    this.stream = stream;
+    this.ctx = ctx;
+    this.tap = tap;
+  }
+
+  close() {
+    this.stream?.getTracks().forEach((t) => t.stop());
+    this.tap?.disconnect();
+    void this.ctx?.close();
+    this.stream = this.ctx = this.tap = null;
+    this.analyser = null;
+    this.ring = [];
+    this.ringLen = 0;
+  }
+
+  /** The last `seconds` of audio before now. */
+  preroll(seconds: number): Float32Array[] {
+    const want = seconds * this.sampleRate;
+    const out: Float32Array[] = [];
+    let got = 0;
+    for (let i = this.ring.length - 1; i >= 0 && got < want; i--) {
+      out.unshift(this.ring[i]);
+      got += this.ring[i].length;
+    }
+    return out;
+  }
+
+  listen(sink: (block: Float32Array) => void): () => void {
+    this.sinks.add(sink);
+    return () => this.sinks.delete(sink);
   }
 
   /** RMS level 0..1, gently boosted so normal speech reads ~0.3–0.8. */
@@ -28,6 +90,150 @@ export class MicMeter {
     }
     return Math.min(1, Math.sqrt(sum / this.data.length) * 4);
   }
+}
+
+/** Mono float PCM → 16 kHz 16-bit WAV, base64. */
+function toWavBase64(blocks: Float32Array[], inRate: number): string {
+  const total = blocks.reduce((n, b) => n + b.length, 0);
+  const outRate = 16000;
+  const ratio = inRate / outRate;
+  const n = Math.floor(total / ratio);
+  const flat = new Float32Array(total);
+  let o = 0;
+  for (const b of blocks) {
+    flat.set(b, o);
+    o += b.length;
+  }
+  const buf = new ArrayBuffer(44 + n * 2);
+  const v = new DataView(buf);
+  const w = (off: number, str: string) => [...str].forEach((c, i) => v.setUint8(off + i, c.charCodeAt(0)));
+  w(0, "RIFF");
+  v.setUint32(4, 36 + n * 2, true);
+  w(8, "WAVE");
+  w(12, "fmt ");
+  v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true);
+  v.setUint16(22, 1, true);
+  v.setUint32(24, outRate, true);
+  v.setUint32(28, outRate * 2, true);
+  v.setUint16(32, 2, true);
+  v.setUint16(34, 16, true);
+  w(36, "data");
+  v.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) {
+    // box-average each output sample over its input window: cheap anti-aliasing
+    const a = Math.floor(i * ratio);
+    const b = Math.min(total, Math.floor((i + 1) * ratio));
+    let sum = 0;
+    for (let j = a; j < b; j++) sum += flat[j];
+    const x = Math.max(-1, Math.min(1, sum / Math.max(1, b - a)));
+    v.setInt16(44 + i * 2, x * 32767, true);
+  }
+  const bytes = new Uint8Array(buf);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 8192) bin += String.fromCharCode(...bytes.subarray(i, i + 8192));
+  return btoa(bin);
+}
+
+export interface SpeechCapture {
+  onInterim: (text: string) => void;
+  onFinal: (text: string) => void;
+  onEnd: () => void;
+  start(): void;
+  stop(): void;
+}
+
+/**
+ * Transcription from the chosen meeting-room mic. Chrome's built-in
+ * recognizer only ever hears the system default mic, so with a specific mic
+ * selected the audio is captured here (with ~0.6 s of pre-roll so the first
+ * word survives) and transcribed by gpt-audio-mini via OpenRouter.
+ */
+export class CloudRecognizer implements SpeechCapture {
+  onInterim: (text: string) => void = () => {};
+  onFinal: (text: string) => void = () => {};
+  onEnd: () => void = () => {};
+  private stopNow = false;
+  private mic: MicMeter;
+
+  constructor(mic: MicMeter) {
+    this.mic = mic;
+  }
+
+  start() {
+    const mic = this.mic;
+    const blocks = mic.preroll(0.6);
+    let heard = false;
+    let lastLoud = performance.now();
+    const started = performance.now();
+    const unlisten = mic.listen((b) => blocks.push(b));
+    this.onInterim("…");
+
+    const done = async () => {
+      window.clearInterval(vad);
+      unlisten();
+      if (!heard) {
+        this.onEnd();
+        return;
+      }
+      this.onInterim("transkriberer …");
+      try {
+        const text = await transcribe(toWavBase64(blocks, mic.sampleRate));
+        if (text) this.onFinal(text);
+      } catch (err) {
+        console.warn("transcription failed", err);
+      }
+      this.onEnd();
+    };
+
+    // a simple level VAD: speech → wait for 0.8 s of quiet; nothing for 4 s → give up
+    const vad = window.setInterval(() => {
+      const now = performance.now();
+      const loud = mic.level() > 0.12;
+      if (loud) {
+        heard = true;
+        lastLoud = now;
+      }
+      if (
+        this.stopNow ||
+        (heard && now - lastLoud > 800) ||
+        (!heard && now - started > 4000) ||
+        now - started > 20000
+      ) {
+        void done();
+      }
+    }, 50);
+  }
+
+  stop() {
+    this.stopNow = true;
+  }
+}
+
+async function transcribe(wavB64: string): Promise<string> {
+  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${settings.key}`,
+      "Content-Type": "application/json",
+      "X-Title": "Octa",
+    },
+    body: JSON.stringify({
+      model: "openai/gpt-audio-mini",
+      messages: [
+        {
+          role: "system",
+          content:
+            "Transcribe the audio verbatim. Output only the transcript, in the language spoken " +
+            "(usually Norwegian bokmål). If there is no clear speech, output nothing.",
+        },
+        { role: "user", content: [{ type: "input_audio", input_audio: { data: wavB64, format: "wav" } }] },
+      ],
+    }),
+  });
+  if (!res.ok) throw new Error(`transcribe ${res.status}`);
+  const data = await res.json();
+  return String(data.choices?.[0]?.message?.content ?? "").trim();
 }
 
 // lib.dom has SpeechRecognitionEvent but not the recognizer itself
@@ -44,7 +250,7 @@ interface SpeechRecognition {
 
 type RecognitionCtor = new () => SpeechRecognition;
 
-export class Recognizer {
+export class Recognizer implements SpeechCapture {
   private rec: SpeechRecognition | null = null;
 
   onInterim: (text: string) => void = () => {};
