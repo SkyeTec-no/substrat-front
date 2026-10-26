@@ -107,6 +107,10 @@ interface Person {
   faceAt: number; // last time the face mesh read this person's face
   raiseSince: number; // wrist above the head (from the pose), held
   raiseFired: boolean;
+  /** Elbows and wrists (video px): a raised arm can look like a small person. */
+  arms: { x: number; y: number }[];
+  /** Torso box (shoulders–hips, video px): stable when they turn or raise a hand. */
+  box: { x0: number; y0: number; x1: number; y1: number };
   /** A still of their face, taken the moment they faced the camera — kept for the tile. */
   portrait: HTMLCanvasElement | null;
   portraitAt: number;
@@ -280,7 +284,7 @@ export class GestureControl {
   private frameCount = 0;
   private lastTick = 0;
   private poseTicks = 0;
-  private candidates: { cx: number; cy: number; w: number; seen: number; at: number }[] = [];
+  private candidates: { cx: number; cy: number; w: number; seen: number; at: number; first: number }[] = [];
   private gone: {
     id: number; cx: number; cy: number; w: number;
     portrait: HTMLCanvasElement | null; portraitAt: number; at: number;
@@ -392,11 +396,14 @@ export class GestureControl {
   }
 
   /** Head and a little shoulder, mirrored like everything else on screen. */
-  private snapPortrait(p: Person, now: number) {
+  private snapPortrait(p: Person, now: number, face: { x0: number; y0: number; x1: number; y1: number }) {
     const video = this.video!;
-    const side = Math.max(p.w * 2.2, 72);
-    const sx = Math.max(0, Math.min(video.videoWidth - side, p.cx - side / 2));
-    const sy = Math.max(0, Math.min(video.videoHeight - side, p.cy - side * 0.45));
+    // the mesh spans brow to chin: pad it so hair, ears and chin all fit
+    const side = Math.min(video.videoHeight, Math.max(face.x1 - face.x0, face.y1 - face.y0) * 1.7);
+    const fx = (face.x0 + face.x1) / 2;
+    const fy = (face.y0 + face.y1) / 2 - side * 0.06; // a touch of headroom
+    const sx = Math.max(0, Math.min(video.videoWidth - side, fx - side / 2));
+    const sy = Math.max(0, Math.min(video.videoHeight - side, fy - side / 2));
     const c = (p.portrait ??= document.createElement("canvas"));
     c.width = c.height = 160;
     const ctx = c.getContext("2d")!;
@@ -516,7 +523,11 @@ export class GestureControl {
     // two tracks on one head (overlapping tiles) — the older one stays
     for (const p of [...this.persons]) {
       const twin = this.persons.find(
-        (q) => q !== p && q.id < p.id && Math.hypot(q.cx - p.cx, q.cy - p.cy) < Math.max(q.w, p.w) * 0.8
+        (q) =>
+          q !== p &&
+          q.id < p.id &&
+          (Math.hypot(q.cx - p.cx, q.cy - p.cy) < Math.max(q.w, p.w) * 0.8 ||
+            this.sameBody(q, p.box, { x: p.cx, y: p.cy }))
       );
       if (twin) {
         twin.portrait ??= p.portrait;
@@ -546,9 +557,27 @@ export class GestureControl {
     const vis = (i: number) => (pts[i]?.v ?? 0) > 0.5;
     const dist = (a: number, b: number) => Math.hypot(pts[a].x - pts[b].x, pts[a].y - pts[b].y);
     // 0 nose · 2/5 eyes · 7/8 ears · 11/12 shoulders · 15/16 wrists
+    // the torso (shoulders + hips) barely moves when someone raises a hand or
+    // turns around — it's the anchor for "is this the same person?"
+    const torsoPts = [11, 12, 23, 24].filter(vis).map((i) => pts[i]);
+    const box = torsoPts.length >= 2
+      ? {
+          x0: Math.min(...torsoPts.map((q) => q.x)),
+          y0: Math.min(...torsoPts.map((q) => q.y)),
+          x1: Math.max(...torsoPts.map((q) => q.x)),
+          y1: Math.max(...torsoPts.map((q) => q.y)),
+        }
+      : null;
     const face = [0, 2, 5].filter(vis);
     const head = face.length ? face : [7, 8].filter(vis);
-    if (!head.length) return;
+    if (!head.length) {
+      // turned away (no face, no ears): keep whoever owns this torso alive
+      if (box) {
+        const owner = this.persons.find((p) => this.sameBody(p, box, null));
+        if (owner) owner.lastSeen = now;
+      }
+      return;
+    }
     const cx = head.reduce((a, i) => a + pts[i].x, 0) / head.length;
     const cy = head.reduce((a, i) => a + pts[i].y, 0) / head.length;
     const w = Math.max(
@@ -563,6 +592,9 @@ export class GestureControl {
     // gives a wrong head, and someone close to the camera is too big for a
     // tile at all. The full frame (or the neighbouring tile) covers them.
     const full = tile.w === vw && tile.h === vh;
+    // the pose model extrapolates: a "head" outside the image it was given is a
+    // guess about a body it only partly saw (a sweater, a shoulder) — drop it
+    if (cx < tile.x || cx > tile.x + tile.w || cy < tile.y || cy > tile.y + tile.h) return;
     if (!full) {
       if (w > tile.w * 0.3) return;
       const m = Math.max(w * 0.6, tile.w * 0.05);
@@ -581,35 +613,57 @@ export class GestureControl {
     }
     const ears = [7, 8].filter(vis).map((i) => ({ x: pts[i].x / vw, y: pts[i].y / vh }));
     const wrists = [15, 16].filter(vis).map((i) => ({ x: pts[i].x, y: pts[i].y }));
+    const arms = [13, 14, 15, 16].filter(vis).map((i) => ({ x: pts[i].x, y: pts[i].y }));
 
-    // overlapping tiles see the same person twice — nearest known head wins
+    // same person if the torsos overlap, the head sits on their torso, or the
+    // heads are close — overlapping tiles, raised arms and turned heads all
+    // land here instead of minting someone new
     let best: Person | null = null;
     let bestDist = Infinity;
     for (const p of this.persons) {
       const d = Math.hypot(p.cx - cx, p.cy - cy);
-      if (d < Math.max(p.w, w) * 1.2 && d < bestDist) {
+      if ((d < Math.max(p.w, w) * 1.2 || this.sameBody(p, box, { x: cx, y: cy })) && d < bestDist) {
         best = p;
         bestDist = d;
       }
     }
     if (best) {
+      if (box) best.box = box;
+      if (full || !this.isBig(best, tile)) best.arms = arms;
       best.cx += (cx - best.cx) * 0.5;
       best.cy += (cy - best.cy) * 0.5;
       best.w += (w - best.w) * 0.5;
       best.h += (h - best.h) * 0.5;
     } else {
-      // a stranger must show up twice before they get a number — one stray
+      // a stranger must keep showing up before they get a number — one stray
       // detection shouldn't mint a new person
+      // anything sitting on someone's torso (a raised arm, a half-seen head)
+      // is part of them, never a newcomer
+      if (this.persons.some((p) => this.sameBody(p, box, { x: cx, y: cy }))) return;
+      // a raised hand seen up close fools the pose model into a small "person"
+      // whose head is the hand — anything at someone's elbow or wrist is theirs
+      if (
+        this.persons.some((p) =>
+          p.arms.some((a) => Math.hypot(a.x - cx, a.y - cy) < Math.max(w * 1.5, p.w * 0.6))
+        )
+      ) {
+        return;
+      }
+      // someone close to the camera fills several tiles: tile hits inside their
+      // reach are fragments of them, never anyone new
+      if (!full && this.persons.some((p) => this.isBig(p, tile) && this.inReach(p, cx, cy))) return;
       const cand = this.candidates.find((c) => Math.hypot(c.cx - cx, c.cy - cy) < Math.max(c.w, w) * 1.2);
       if (!cand) {
-        this.candidates.push({ cx, cy, w, seen: 1, at: now });
+        this.candidates.push({ cx, cy, w, seen: 1, at: now, first: now });
         return;
       }
       cand.cx = cx;
       cand.cy = cy;
       cand.w = w;
       cand.at = now;
-      if (++cand.seen < 2) return;
+      // three sightings over most of a second: a lowering arm or a passing
+      // shadow flickers out before that
+      if (++cand.seen < 3 || now - cand.first < 800) return;
       this.candidates = this.candidates.filter((c) => c !== cand);
       // someone who just left and came back keeps their number and portrait
       const ghost = this.reclaim(cx, cy, w);
@@ -617,6 +671,8 @@ export class GestureControl {
         id: ghost?.id ?? this.nextPersonId++, cx, cy, w, h, top: 0, ears, wrists, lastSeen: now,
         poseFacing, faceAt: 0, raiseSince: 0, raiseFired: false,
         portrait: ghost?.portrait ?? null, portraitAt: ghost?.portraitAt ?? 0,
+        box: box ?? { x0: cx - w, y0: cy + h * 0.6, x1: cx + w, y1: cy + h * 2.5 },
+        arms,
         mouth: [], lookEma: 0, looking: false,
       };
       this.persons.push(best);
@@ -641,6 +697,44 @@ export class GestureControl {
         this.floor?.raise(best.id);
       }
     }
+  }
+
+  /** Big next to a tile — i.e. close to the camera. */
+  private isBig(p: Person, tile: { w: number }): boolean {
+    return p.w > tile.w * 0.2;
+  }
+
+  /** Inside everything person p occupies: head, torso and arms, plus a margin. */
+  private inReach(p: Person, x: number, y: number): boolean {
+    const xs = [p.cx - p.w, p.cx + p.w, p.box.x0, p.box.x1, ...p.arms.map((a) => a.x)];
+    const ys = [p.cy - p.h, p.cy + p.h, p.box.y0, p.box.y1, ...p.arms.map((a) => a.y)];
+    const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+    const mx = (x1 - x0) * 0.1, my = (y1 - y0) * 0.1;
+    return x > x0 - mx && x < x1 + mx && y > y0 - my && y < y1 + my;
+  }
+
+  /** Does this torso box / head point belong to person p? Torsos overlap, or
+   *  the head sits within p's torso widened to the shoulders' reach. */
+  private sameBody(
+    p: Person,
+    box: { x0: number; y0: number; x1: number; y1: number } | null,
+    headPt: { x: number; y: number } | null
+  ): boolean {
+    const b = p.box;
+    if (box) {
+      const ix = Math.max(0, Math.min(b.x1, box.x1) - Math.max(b.x0, box.x0));
+      const iy = Math.max(0, Math.min(b.y1, box.y1) - Math.max(b.y0, box.y0));
+      const inter = ix * iy;
+      const union = (b.x1 - b.x0) * (b.y1 - b.y0) + (box.x1 - box.x0) * (box.y1 - box.y0) - inter;
+      if (union > 0 && inter / union > 0.3) return true;
+    }
+    if (headPt) {
+      // the head floats above the shoulders — extend the box upward by a head
+      const padX = (b.x1 - b.x0) * 0.15;
+      const above = p.h * 1.6;
+      if (headPt.x > b.x0 - padX && headPt.x < b.x1 + padX && headPt.y > b.y0 - above && headPt.y < b.y1) return true;
+    }
+    return false;
   }
 
   /** A recently departed person near (cx, cy) — or, if nobody is in view at all,
@@ -683,7 +777,16 @@ export class GestureControl {
     this.updateLook(p, facingNow);
     // portrait: snap one the moment they look straight at the camera, keep it
     // (re-taken after 10 min, so it follows people who change seats or light)
-    if (facingNow && p.looking && (!p.portrait || now - p.portraitAt > 600_000)) this.snapPortrait(p, now);
+    if (facingNow && p.looking && (!p.portrait || now - p.portraitAt > 600_000)) {
+      // frame the whole face from the mesh itself (crop → video px), not the
+      // rough pose estimate — that clipped chins and foreheads up close
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (const l of lm) {
+        x0 = Math.min(x0, l.x); x1 = Math.max(x1, l.x);
+        y0 = Math.min(y0, l.y); y1 = Math.max(y1, l.y);
+      }
+      this.snapPortrait(p, now, { x0: sx + x0 * side, y0: sy + y0 * side, x1: sx + x1 * side, y1: sy + y1 * side });
+    }
     p.mouth.push({ t: now, gap, moving, looking: p.looking });
     while (p.mouth.length && now - p.mouth[0].t > MOUTH_LOG_MS) p.mouth.shift();
   }

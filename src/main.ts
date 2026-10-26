@@ -9,7 +9,7 @@ import { respond, keynote, repairMermaid, generateReport, generateCompliments, g
 import { remember, clearHistory } from "./history";
 import { renderMermaidSvg } from "./visuals";
 import { isDownloadCommand, downloadArtifacts } from "./download";
-import { tierCommand, isRecallCommand, isDismissCommand, isDismissAll, isOpenCommand, isShelveCommand, isNoteCommand, isStopNotesCommand, isReportCommand, matchPanel } from "./commands";
+import { tierCommand, isDeictic, zoomCommand, findPanel, isRecallCommand, isDismissCommand, isDismissAll, isOpenCommand, isShelveCommand, isNoteCommand, isStopNotesCommand, isReportCommand } from "./commands";
 import { buildReportPdf, type ReportArtifact } from "./report";
 import { loadImage, svgToCanvas, createTableRenderer, createWipeRenderer, createSlideRenderer, noteToCanvas } from "./panels";
 import { GestureControl, captureCameraFrame, type HandState, type MeetingState } from "./gestures";
@@ -502,6 +502,21 @@ function interrupt() {
   speakLevel = 0;
 }
 
+/** Which panel a voice command means: the pointed one for "denne/this" (or
+ *  when the words name nothing in particular), else the best match by kind and
+ *  description, else the fallback. */
+function resolvePanel(heard: string, opts: { fallback: "focused" | "latest" | "none" }): string | null {
+  const panels = scene.listPanels();
+  if (!panels.length) return null;
+  const pointed = scene.highlightedPanel();
+  const named = findPanel(heard, panels);
+  if (pointed && (isDeictic(heard) || !named)) return pointed;
+  if (named) return named;
+  if (opts.fallback === "focused") return scene.focusedPanelId();
+  if (opts.fallback === "latest") return panels.at(-1)?.id ?? null;
+  return null;
+}
+
 async function converse() {
   if (noteMode) return; // the scribe owns the microphone
   sound?.ensureRunning();
@@ -683,8 +698,24 @@ async function converse() {
     return;
   }
 
+  // "forstørr / forminsk / tilbakestill" — the pointed (or focused) panel
+  const zoom = zoomCommand(heard);
+  if (zoom) {
+    const id = resolvePanel(heard, { fallback: "focused" });
+    if (!id) {
+      await localReply("Ingenting er i fokus.");
+      return;
+    }
+    scene.recallPanel(id); // a shelved panel comes forward first
+    if (zoom === "reset") scene.resetPanelView(id);
+    else scene.zoomPanel(id, zoom === "in" ? 1.45 : 1 / 1.45);
+    sound?.ping(zoom === "out" ? 740 : 1175, 0.05);
+    await localReply(zoom === "in" ? pickLine(["Nærmere.", "Forstørret."]) : zoom === "out" ? "Mindre." : "Tilbakestilt.");
+    return;
+  }
+
   if (isShelveCommand(heard)) {
-    const id = scene.focusedPanelId();
+    const id = resolvePanel(heard, { fallback: "focused" });
     if (id) {
       scene.shelfPanel(id);
       sound?.ping(996, 0.06);
@@ -698,7 +729,7 @@ async function converse() {
   if (isOpenCommand(heard)) {
     // "open this" = whatever has highlight focus (hand hover or mouse)
     const target =
-      scene.highlightedPanel() ??
+      resolvePanel(heard, { fallback: "none" }) ??
       [...scene.listPanels()].reverse().find((p) => p.id !== scene.focusedPanelId())?.id;
     if (target && scene.recallPanel(target)) {
       sound?.ping(880, 0.07);
@@ -710,7 +741,7 @@ async function converse() {
   }
 
   if (isRecallCommand(heard)) {
-    const target = matchPanel(heard, scene.listPanels());
+    const target = resolvePanel(heard, { fallback: "latest" });
     if (target && scene.recallPanel(target)) {
       await localReply(pickLine(["Her er den.", "Henter den tilbake.", "På skjermen.", "Vær så god."]));
     } else {
@@ -728,7 +759,7 @@ async function converse() {
       visualsEl.innerHTML = "";
       await localReply(pickLine(["Alt fjernet.", "Skjermen er tom.", "Borte."]));
     } else {
-      const target = matchPanel(heard, panels);
+      const target = resolvePanel(heard, { fallback: "latest" });
       if (target) scene.removePanel(target);
       await localReply(pickLine(["Borte.", "Fjernet.", "Vekk."]));
     }
@@ -1202,7 +1233,6 @@ function renderMeeting(m: MeetingState) {
 }
 
 let gestures: GestureControl | null = null;
-let wasPinching = false;
 let floorHolder: number | null = null;
 let meetingPersons = 0;
 
@@ -1224,24 +1254,14 @@ async function enableHandGestures() {
   try {
     await gestures.start(
       {
-      onPan: (dx, dy) => {
-        if (!settings.handGestures) return;
-        const id = scene.focusedPanelId();
-        if (id) scene.panPanel(id, dx, dy);
-      },
-      onZoom: (factor) => {
-        if (!settings.handGestures) return;
-        const id = scene.focusedPanelId();
-        if (id) scene.zoomPanel(id, factor);
-      },
-      onPalmHold: () => {
-        if (!settings.handGestures) return;
-        // open palm = sweep everything back into the bento grid
-        if (scene.focusedPanelId()) {
-          scene.shelvePanels();
-          sound?.ping(996, 0.07);
-        }
-      },
+      // Hands only point. Moving panels by hand confused people in meetings —
+      // the pointed panel is the target, and voice says what to do with it
+      // ("lukk denne", "se på denne", "forstørr").
+      onPan: () => {},
+      onZoom: () => {},
+      onPalmHold: () => {},
+      onFistOpen: () => {},
+      onDoublePinch: () => {},
       onEarTouch: () => {
         if (!settings.handGestures) return;
         // hand to ear = "I'm listening" — barge in from any state except capture
@@ -1252,43 +1272,16 @@ async function enableHandGestures() {
       onHandsCrossed: () => {
         if (noteMode) exitNoteMode();
       },
-      onFistOpen: (x, y) => {
-        if (!settings.handGestures) return;
-        // open the fist over a grid item → pull it forth into focus
-        const hit = scene.hitPanel(x, y);
-        const target =
-          (hit && !hit.focused ? hit.id : null) ??
-          scene.nearestShelfPanel(x, y) ??
-          scene.highlightedPanel();
-        if (target && scene.recallPanel(target)) sound?.ping(880, 0.07);
-      },
-      onDoublePinch: (x, y) => {
-        if (!settings.handGestures) return;
-        const hit = scene.hitPanel(x, y);
-        if (hit && !hit.focused) {
-          scene.recallPanel(hit.id);
-          sound?.ping(880, 0.07);
-        } else if (hit?.focused) {
-          scene.resetPanelView(hit.id);
-        }
-      },
       onHead: (nx, ny, size) => scene.setHeadPosition(nx, ny, size),
       onHands: (all) => {
         const hands = settings.handGestures ? all : [];
         renderHandDots(hands);
         const steering = hands.filter((h) => h.active);
-        // pinch release after an upward pinch-drag also shelves the panel
-        const anyPinch = steering.some((h) => h.pinching);
-        if (wasPinching && !anyPinch && settings.handGestures) {
-          const id = scene.focusedPanelId();
-          if (id && scene.maybeShelfAfterDrag(id)) sound?.ping(996, 0.06);
-        }
-        wasPinching = anyPinch;
+        // pointing: the panel under the holder's hand — focused or on the
+        // shelf (magnetic) — becomes the target for "denne"
         let hover: string | null = null;
         for (const h of steering) {
-          // an open hand near a shelf tile marks it as the candidate (magnetic)
-          const hit = scene.hitPanel(h.x, h.y);
-          hover = hit && !hit.focused ? hit.id : scene.nearestShelfPanel(h.x, h.y);
+          hover = scene.hitPanel(h.x, h.y)?.id ?? scene.nearestShelfPanel(h.x, h.y);
           if (hover) break;
         }
         claimHighlight("hand", hover);

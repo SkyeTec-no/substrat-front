@@ -7,8 +7,42 @@ export function isRecallCommand(text: string): boolean {
     /\b(bring\s+(forth|back|up)|recall|pull\s+up)\b/i.test(text) ||
     (/\b(show|display)\b/i.test(text) && /\bagain\b/i.test(text)) ||
     /\bhent\s+(frem|fram|tilbake|opp)\b/i.test(text) ||
-    (/\bvis\b/i.test(text) && /\bigjen\b/i.test(text))
+    /\bta\s+(frem|fram|opp)\b/i.test(text) ||
+    (/\bvis\b/i.test(text) && /\bigjen\b/i.test(text)) ||
+    /\bvis\s+(meg\s+)?(bildet|diagrammet|grafen|tabellen|lysbildet|notatene|notatet)\b/i.test(text)
   );
+}
+
+/** "this / that" — the command means whatever is being pointed at. */
+export function isDeictic(text: string): boolean {
+  return /\b(denne|dette|den her|det her|this|that one|this one)\b/i.test(text);
+}
+
+/** "forstørr / zoom inn" etc. — size of the panel in focus. */
+export function zoomCommand(text: string): "in" | "out" | "reset" | null {
+  if (/\b(tilbakestill|nullstill|vanlig størrelse|reset( the)? (zoom|view))/i.test(text)) return "reset";
+  if (/\b(forstørr|zoom(e)? inn|zoom in|enlarge)/i.test(text)) return "in";
+  if (/\b(forminsk|zoom(e)? ut|zoom out)/i.test(text)) return "out";
+  // "større" / "mindre" are everyday words — only a command when short
+  // ("større!") or aimed at the panel ("gjør den større")
+  const short = text.trim().split(/\s+/).length <= 3;
+  const aimed = /\bgjør\s+(den|det|denne|dette|bildet|grafen|diagrammet|tabellen|lysbildet)\b/i.test(text) || /\bmake it\b/i.test(text);
+  if (short || aimed) {
+    if (/\b(større|nærmere|bigger|closer)\b/i.test(text)) return "in";
+    if (/\b(mindre|smaller)\b/i.test(text)) return "out";
+  }
+  return null;
+}
+
+/** What kind of panel a request names, as the suffix panel ids carry. */
+export function panelKind(text: string): string | null {
+  if (/\b(bilde|bildet|foto|image|picture|photo)/i.test(text)) return "img";
+  if (/\b(diagram|flytskjema|flowchart|mindmap|tankekart)/i.test(text)) return "svg";
+  if (/\b(graf|grafen|stolpe|chart|graph|plot)/i.test(text)) return "chart";
+  if (/\b(tabell|table)/i.test(text)) return "tbl";
+  if (/\b(lysbilde|slide|punktene|keynote)/i.test(text)) return "slide";
+  if (/\b(notat|notes|note)/i.test(text)) return "note";
+  return null;
 }
 
 /** "generate a report / make a PDF" — assemble the canvas into a document. */
@@ -39,6 +73,8 @@ export function isStopNotesCommand(text: string): boolean {
 /** "open this/that" — acts on whatever panel currently has highlight focus. */
 export function isOpenCommand(text: string): boolean {
   return (
+    /\b(se|kikk)\s+på\s+(denne|dette|den|det)\b/i.test(text) ||
+    /\b(vis|ta\s+frem|ta\s+fram)\s+(denne|dette)\b/i.test(text) ||
     /\b(open|focus on|expand)\b.{0,16}\b(this|that|it|one)\b/i.test(text) ||
     /^\s*open\s*[.!]?\s*$/i.test(text) ||
     /(?:^|\s)(åpne|fokuser på|utvid)\s.{0,16}\b(denne|dette|den|det)\b/i.test(text) ||
@@ -62,7 +98,7 @@ export function isDismissCommand(text: string): boolean {
     (/\b(remove|dismiss|hide|clear)\b/i.test(text) &&
       /\b(it|that|this|them|panel|panels|image|picture|diagram|chart|table|all|everything|screen)\b/i.test(text)) ||
     (/\b(fjern|skjul|lukk|rydd( bort| opp)?)\b/i.test(text) &&
-      /\b(den|det|dette|dem|panel|panelet|bildet|diagrammet|grafen|tabellen|alt|alle|skjermen)\b/i.test(text))
+      /\b(den|denne|det|dette|dem|panel|panelet|paneler|panelene|bildet|diagrammet|grafen|tabellen|lysbildet|notatene|alt|alle|skjermen)\b/i.test(text))
   );
 }
 
@@ -103,6 +139,8 @@ const STOP = new Set([
   "hent", "frem", "fram", "tilbake", "opp", "vis", "igjen", "fjern", "skjul",
   "lukk", "den", "det", "dette", "dem", "meg", "kan", "du", "bildet",
   "diagrammet", "grafen", "tabellen", "panelet", "og", "med", "fra",
+  "ta", "frem", "fram", "lukk", "denne", "dette", "på", "se", "alle", "paneler",
+  "panelene", "bilde", "lysbildet", "notatene", "forstørr", "forminsk",
 ]);
 
 /** Strip common Norwegian noun endings: notatene → notat, bildet → bild. */
@@ -110,13 +148,17 @@ function stem(word: string): string {
   return word.length > 5 ? word.replace(/(ene|ane|en|et|er|a)$/, "") : word;
 }
 
-/** Pick the panel whose description best matches the request; latest wins ties. */
-export function matchPanel(
+/** The panel the words actually name (by kind and description) — null if none. */
+export function findPanel(
   text: string,
   panels: { id: string; desc: string }[]
 ): string | null {
   const words = text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
   const keys = words.filter((w) => w.length > 2 && !STOP.has(w));
+  // "bildet av hunden": only images are candidates — ids end in their kind
+  const kind = panelKind(text);
+  const ofKind = kind ? panels.filter((p) => new RegExp(`-${kind}\\d*$`).test(p.id)) : [];
+  if (ofKind.length) panels = ofKind;
 
   let best: string | null = null;
   let bestScore = 0;
@@ -130,5 +172,11 @@ export function matchPanel(
       best = p.id;
     }
   }
-  return best ?? panels.at(-1)?.id ?? null;
+  // a named kind with no word match: the latest panel of that kind
+  return best ?? (ofKind.length ? ofKind.at(-1)!.id : null);
+}
+
+/** Pick the panel whose description best matches the request; latest wins ties. */
+export function matchPanel(text: string, panels: { id: string; desc: string }[]): string | null {
+  return findPanel(text, panels) ?? panels.at(-1)?.id ?? null;
 }

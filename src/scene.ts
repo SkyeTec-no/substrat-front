@@ -945,6 +945,16 @@ export class OctaScene {
     if (id === this.highlightedId) return;
     const prev = this.highlightedId ? this.panels.get(this.highlightedId) : null;
     this.highlightedId = id;
+    // a focused panel being pointed at gets a Signal-orange frame
+    if (prev?.focused) {
+      gsap.to(prev.frameMat, { opacity: prev.frameMax, duration: 0.3 });
+      prev.frameMat.color.copy(this.frameColor);
+    }
+    const next = id ? this.panels.get(id) : null;
+    if (next?.focused) {
+      next.frameMat.color.set("#d94018");
+      gsap.to(next.frameMat, { opacity: 0.9, duration: 0.2 });
+    }
     if (prev && !prev.focused) {
       const s = prev.shelfScale;
       gsap.to(prev.mat, { opacity: 0.3, duration: 0.3 });
