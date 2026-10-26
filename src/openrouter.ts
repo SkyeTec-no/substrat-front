@@ -79,7 +79,7 @@ export const settings = {
 export async function chat(
   messages: ORMessage[],
   model = settings.model,
-  opts: { imageOutput?: boolean; webSearch?: boolean; json?: boolean } = {}
+  opts: { imageOutput?: boolean; webSearch?: boolean; json?: boolean; effort?: string } = {}
 ): Promise<ChatResult> {
   const res = await fetch(`${BASE}/chat/completions`, {
     method: "POST",
@@ -99,9 +99,11 @@ export async function chat(
       // model into answering in plain text and the protocol (slides!) is lost
       ...(opts.json ? { response_format: { type: "json_object" } } : {}),
       // the fast brain answers sooner with less thinking; the smart one keeps its default
-      ...(model === settings.fastModel && settings.fastEffort !== "default" && !opts.imageOutput
-        ? { reasoning: { effort: settings.fastEffort } }
-        : {}),
+      ...(opts.effort
+        ? { reasoning: { effort: opts.effort } }
+        : model === settings.fastModel && settings.fastEffort !== "default" && !opts.imageOutput
+          ? { reasoning: { effort: settings.fastEffort } }
+          : {}),
     }),
   });
   if (!res.ok) {

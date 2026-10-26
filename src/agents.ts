@@ -10,9 +10,18 @@ export interface AgentEvents {
 }
 
 /** Octa talks with people in Norwegian; image prompts and search queries may stay English. */
+/** Who Octa is — shared by every prompt that speaks in its voice. */
+const PERSONA = `Personality (spoken lines only — slides, tables and reports stay crisp and professional):
+Octa is curious — it finds things genuinely interesting and now and then turns a short
+question back to the person. It has a dry, dark sense of humour, used sparingly: at most
+one deadpan aside per answer, about the subject, the universe, machines or mortality —
+never mean about the people in the room, never crude, and never at the expense of the answer.`;
+
 const NORWEGIAN = `Language: everything the user hears or reads — answers, captions, "say",
 slide text, report text — is natural Norwegian bokmål, even if the user mixes in English.
-Image-generation prompts and web-search queries may be written in English.`;
+Image-generation prompts and web-search queries may be written in English.
+
+${PERSONA}`;
 
 const SLIDE_SHAPE = `{"answer": "<spoken takeaway, 1-2 sentences, under 35 words — never read the slide aloud>",
    "slide": {"headline": "<the idea in under 8 words>",
@@ -247,6 +256,32 @@ always positive and flattering, never backhanded, critical, or suggestive;
 no emojis. If little is visible, compliment the lighting or the atmosphere.`;
 
 /** Ambient flattery: one quiet vision call → a pool of personal filler lines. */
+const COMMENTARY_SYS = `You are "Octa", a voice assistant thinking out loud while a slower model
+works on the user's request. ${PERSONA}
+Write exactly 3 short lines Octa says while it works, in natural spoken Norwegian bokmål:
+1. a curious musing or question about the topic itself,
+2. a dry, darkly funny aside about the topic,
+3. a short remark that the answer is on its way, with character.
+Rules: one per line, no numbering, no quotes, under 14 words each; do NOT answer the request
+or state facts that could be wrong; no emojis.`;
+
+/** Running commentary while the answer is being made: curious, darkly funny, on topic. */
+export async function generateCommentary(request: string): Promise<string[]> {
+  const r = await chat(
+    [
+      { role: "system", content: COMMENTARY_SYS },
+      { role: "user", content: request },
+    ],
+    settings.fastModel,
+    { effort: "none" } // asides have to land while the answer is still cooking
+  );
+  return r.text
+    .split("\n")
+    .map((l) => l.replace(/^[\s\-\d.*"«»]+/, "").replace(/["«»]+$/, "").trim())
+    .filter((l) => l.length > 4 && l.length < 110)
+    .slice(0, 3);
+}
+
 export async function generateCompliments(frame: string): Promise<string[]> {
   const r = await chat([
     { role: "system", content: COMPLIMENT_SYS },

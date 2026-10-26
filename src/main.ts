@@ -4,7 +4,7 @@ import { Soundscape } from "./sound";
 import { MicMeter, Recognizer, Speaker } from "./speech";
 import { think } from "./brain";
 import { settings, listModels, type ChatResult, type ModelTier, type VoiceStyle } from "./openrouter";
-import { respond, keynote, repairMermaid, generateReport, generateCompliments } from "./agents";
+import { respond, keynote, repairMermaid, generateReport, generateCompliments, generateCommentary } from "./agents";
 import { remember, clearHistory } from "./history";
 import { renderMermaidSvg } from "./visuals";
 import { isDownloadCommand, downloadArtifacts } from "./download";
@@ -703,6 +703,17 @@ async function converse() {
   setState("thinking");
   void refreshCompliments(); // top up the personal filler pool in the background
 
+  // Octa thinks out loud: a fast side call writes curious / darkly funny lines
+  // about the request, spoken between fillers while the real answer is made
+  const commentary: string[] = [];
+  if (settings.key) {
+    generateCommentary(heard)
+      .then((lines) => {
+        if (myTurn === turnId) commentary.push(...lines);
+      })
+      .catch(() => {});
+  }
+
   // spoken fillers while the LLM round-trip is in flight — same low-latency TTS
   let fillerCount = 0;
   let fillerTimer = 0;
@@ -711,16 +722,21 @@ async function converse() {
       if (myTurn !== turnId || state !== "thinking") return;
       // agent announcements outrank generic fillers — never talk over them
       if (!speaker.speaking) {
-        // first beat is a quick generic; later beats credit the user's look/room
-        const compliment = fillerCount > 0 ? takeCompliment() : undefined;
-        const line = compliment ?? FILLERS[Math.min(fillerCount, FILLERS.length - 1)];
+        // Octa's own commentary on the topic as soon as it's written (a stored
+        // filler covers the gap until then), with a compliment for whoever has
+        // the floor slipped in every third beat
+        const compliment = fillerCount > 0 && fillerCount % 3 === 2 ? takeCompliment() : undefined;
+        const remark = compliment ? undefined : commentary.shift();
+        const line = remark ?? compliment ?? FILLERS[Math.min(fillerCount, FILLERS.length - 1)];
+        if (remark) showTranscript(remark, true); // the aside shows, dimmed, under the orb
         fillerCount++;
         speaker.speak(line, () => {
           scene.pulse(0.6);
           speakLevel = 0.35;
         });
       }
-      scheduleFiller(5000 + Math.random() * 3000);
+      // most answers land within a few seconds — keep the early beats close together
+      scheduleFiller(fillerCount < 3 ? 3000 + Math.random() * 1200 : 5000 + Math.random() * 3000);
     }, delay);
   };
   scheduleFiller(1400);
