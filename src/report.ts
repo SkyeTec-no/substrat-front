@@ -14,6 +14,7 @@ export interface ReportArtifact {
   svgMarkup?: string;
   noteLines?: string[];
   noteTitle?: string;
+  slide?: SlideData;
 }
 
 const W = 595.28; // A4 pt
@@ -23,10 +24,11 @@ const M = 52;
 import {
   setPdfLightRendering,
   createTableRenderer,
+  createSlideRenderer,
   noteToCanvas,
   svgToCanvas,
 } from "./panels";
-import type { TableData } from "./openrouter";
+import type { SlideData, TableData } from "./openrouter";
 
 /** Composite an artifact onto the linen page ground — the PDF is always light. */
 function toLinenPng(source: HTMLCanvasElement | HTMLImageElement): {
@@ -64,6 +66,16 @@ async function resolveLightSource(
     try {
       const r = createTableRenderer(art.table);
       r.draw(999); // settle the stream instantly
+      return r.canvas;
+    } finally {
+      setPdfLightRendering(false);
+    }
+  }
+  if (art.slide) {
+    setPdfLightRendering(true);
+    try {
+      const r = createSlideRenderer(art.slide);
+      r.draw(999); // settle every reveal instantly
       return r.canvas;
     } finally {
       setPdfLightRendering(false);

@@ -1,6 +1,7 @@
-import { chat, settings, type ChatResult, type TableData, type ORMessage } from "./openrouter";
+import { chat, settings, type ChatResult, type SlideData, type TableData, type ORMessage } from "./openrouter";
 import { loadHistory } from "./history";
 import { theme } from "./theme";
+import { ICON_NAMES, isIcon } from "./icons";
 
 /** Fired as parallel sub-agent calls start/finish, so the scene can orbit them. */
 export interface AgentEvents {
@@ -8,13 +9,30 @@ export interface AgentEvents {
   onDone: (id: string) => void;
 }
 
+/** Octa talks with people in Norwegian; image prompts and search queries may stay English. */
+const NORWEGIAN = `Language: everything the user hears or reads — answers, captions, "say",
+slide text, report text — is natural Norwegian bokmål, even if the user mixes in English.
+Image-generation prompts and web-search queries may be written in English.`;
+
+const SLIDE_SHAPE = `{"answer": "<spoken takeaway, 1-2 sentences, under 35 words — never read the slide aloud>",
+   "slide": {"headline": "<the idea in under 8 words>",
+             "stat": {"value": "<one striking number, e.g. 10,000 yrs>", "label": "<what it measures, under 6 words>"},
+             "points": [{"icon": "<one icon name>", "title": "<2-4 words>", "detail": "<under 12 words>"}]}}
+  3 to 5 points. "stat" only when a real, memorable number exists — otherwise omit it.
+  "icon" must be one of: ${ICON_NAMES.join(", ")}. Pick the closest literal match
+  for each point; avoid repeating an icon on the same slide.
+  Slide text is terse keynote copy: no full sentences, no markdown, no sources list.`;
+
 const ROUTER_SYS = `You are the reasoning core of "Octa", a spoken voice assistant.
 Prior conversation turns may precede the latest utterance — use them for context
 (follow-ups, pronouns, "the one you mentioned"). Decide how to handle the latest utterance.
 
 Reply with ONLY a JSON object, no prose, no code fences:
-- Simple requests (greetings, quick facts, chit-chat, follow-ups):
-  {"answer": "<your spoken reply, conversational, under 80 words>"}
+- Greetings, chit-chat, one-fact answers:
+  {"answer": "<your spoken reply, conversational, under 40 words>"}
+- Explanations, overviews, how-tos, advice — anything with more than one fact:
+  answer like a keynote speaker. The voice gives the takeaway, a slide carries the structure.
+  ${SLIDE_SHAPE}
 - Requests that genuinely benefit from parallel analysis (comparisons,
   multi-faceted questions, planning, research-style questions):
   {"subtasks": [{"label": "<2-3 word name>", "prompt": "<focused instruction>"}]}
@@ -41,17 +59,99 @@ Reply with ONLY a JSON object, no prose, no code fences:
 - Questions needing current or live information (stock prices, exchange rates,
   weather, news, sports scores, "latest", anything after your knowledge cutoff):
   {"search": "<focused web search query>"}
+- Requests to use a smarter / more capable model, or to go back to the faster one
+  (however phrased — "tenk grundigere", "kan du bruke en bedre hjerne", "ta det kjapt igjen"):
+  {"tier": "smart" | "fast", "caption": "<one short spoken confirmation>"}
 - Requests about what you can physically see of the user or their surroundings
   ("describe me", "what am I wearing", "how do I look", "what's behind me") —
   only when the camera is available:
-  {"look": "<what to observe and comment on>"}`;
+  {"look": "<what to observe and comment on>"}
+
+${NORWEGIAN}`;
 
 const SUBAGENT_SYS = `You are a focused sub-agent inside a voice assistant.
 Do exactly what the prompt asks. Be dense and concise: under 120 words, plain text.`;
 
 const SYNTH_SYS = `You are the voice of "Octa". Merge the sub-agent findings into one
-spoken reply to the user's original question. Conversational, plain text, under 120 words.
-Do not mention sub-agents or the process — just deliver the insight.`;
+answer to the user's original question, delivered like a keynote: the voice gives the
+takeaway, a slide carries the structure. Do not mention sub-agents or the process.
+Reply with ONLY a JSON object, no code fences:
+${SLIDE_SHAPE}
+
+${NORWEGIAN}`;
+
+function validSlide(s: unknown): s is SlideData {
+  const x = s as SlideData;
+  return (
+    !!x &&
+    typeof x.headline === "string" &&
+    Array.isArray(x.points) &&
+    x.points.length > 0 &&
+    x.points.every((p) => p && typeof p.title === "string")
+  );
+}
+
+/** Models sometimes flatten the slide into the top level ({answer, headline, points}). */
+function liftSlide<T extends Record<string, unknown>>(o: T): T {
+  if (o && !o.slide && typeof o.headline === "string" && Array.isArray(o.points)) {
+    return { ...o, slide: { headline: o.headline, points: o.points, stat: o.stat } };
+  }
+  return o;
+}
+
+/** At most 5 points; unknown icon names are dropped (the point shows its number). */
+function cleanSlide(s: SlideData): SlideData {
+  return {
+    ...s,
+    points: s.points.slice(0, 5).map((p) => ({ ...p, icon: isIcon(p.icon) ? p.icon : undefined })),
+  };
+}
+
+/** Parse an {answer, slide} reply; plain text falls through as the spoken answer. */
+function slideResult(text: string, images: string[] = []): ChatResult {
+  try {
+    const parsed = liftSlide(JSON.parse(extractJson(text))) as { answer?: string; slide?: unknown };
+    if (typeof parsed.answer !== "string") return { text, images };
+    return {
+      text: parsed.answer,
+      images,
+      slide: validSlide(parsed.slide) ? cleanSlide(parsed.slide) : undefined,
+    };
+  } catch {
+    return { text, images };
+  }
+}
+
+const KEYNOTE_SYS = `Turn this spoken answer into a keynote: a short spoken takeaway plus
+a slide that carries the structure. Keep every fact; invent nothing.
+Reply with ONLY a JSON object, no code fences:
+${SLIDE_SHAPE}
+
+${NORWEGIAN}`;
+
+/** Safety net: a long plain-text answer gets restructured into takeaway + slide,
+ *  so the screen never fills with a wall of text. */
+export async function keynote(result: ChatResult): Promise<ChatResult> {
+  const words = result.text.split(/\s+/).length;
+  if (result.slide || result.visual || result.table || result.images.length || words <= 45) {
+    return result;
+  }
+  try {
+    const r = await chat([
+      { role: "system", content: KEYNOTE_SYS },
+      { role: "user", content: result.text },
+    ], settings.model, { json: true });
+    const shaped = slideResult(r.text);
+    return shaped.slide ? { ...result, text: shaped.text, slide: shaped.slide } : result;
+  } catch {
+    return result;
+  }
+}
+
+/** Models don't know what day it is — "i dag" needs telling. */
+function today(): string {
+  return `Today is ${new Date().toLocaleDateString("nb-NO", { weekday: "long", day: "numeric", month: "long", year: "numeric" })}.`;
+}
 
 function extractJson(text: string): string {
   const cleaned = text.replace(/```(?:json)?/g, "").trim();
@@ -125,7 +225,7 @@ async function generateVisual(
       if (m) code = m[0];
     }
     return {
-      text: caption || "Here is the diagram.",
+      text: caption || "Her er diagrammet.",
       images: [],
       visual: { kind, code },
     };
@@ -134,12 +234,13 @@ async function generateVisual(
   }
 }
 
-const COMPLIMENT_SYS = `You see one webcam frame of the user and their room.
+const COMPLIMENT_SYS = `You see one webcam frame of the user (or a close crop of the one person
+who has the floor in a meeting) and their surroundings.
 Write exactly 5 short, warm, specific compliments the assistant can casually speak
 while working — crediting the user's look, style, or interior taste. Examples of
 the register: "I really like your shirt." / "You have such a strong beard." /
 "You look great — have you been working out?" / "Those eyes are like jewels."
-Rules: one per line, no numbering; under 12 words each; natural spoken English;
+Rules: one per line, no numbering; under 12 words each; natural spoken Norwegian bokmål;
 ground each line in something actually visible — clothing, accessories, glasses,
 hair, beard, eyes, a healthy look, room decor, lighting, plants, art, desk setup;
 always positive and flattering, never backhanded, critical, or suggestive;
@@ -173,7 +274,9 @@ Reply with ONLY a JSON object, no code fences:
 Write 5 to 8 sections with a real narrative arc (context, analysis, strategy,
 risks, recommendation). Where an artifact supports a section, reference its id
 in "artifact" AND interpret it in the body — what it shows and what it implies —
-never just mention that it exists. Use every relevant artifact at most once.`;
+never just mention that it exists. Use every relevant artifact at most once.
+
+${NORWEGIAN}`;
 
 /** The analyst: interprets the canvas + history into a structured report. */
 export async function generateReport(
@@ -195,7 +298,7 @@ export async function generateReport(
             ? inventory.map((a) => `${a.id} — ${a.kind} — ${a.desc}`).join("\n")
             : "(the canvas is empty)"),
       },
-    ]);
+    ], settings.model, { json: true });
     const parsed = JSON.parse(extractJson(r.text));
     if (!parsed?.title || !Array.isArray(parsed.sections) || !parsed.sections.length) {
       return null;
@@ -221,7 +324,9 @@ citations on screen or in "say" — unless the user explicitly asked for sources
 relevant figure you found — more rows, more columns, dates, notes, and a
 Source column naming where each figure came from.
 Include "table"/"detail" only when the data is naturally tabular; otherwise omit them.
-Keep numbers exactly as found, with units and currency.`;
+Keep numbers exactly as found, with units and currency.
+
+${NORWEGIAN}`;
 
 /** Drop source/URL columns from the display table (the detail set keeps them). */
 function stripSourceColumns(t: TableData): TableData {
@@ -252,10 +357,11 @@ async function webSearch(query: string, events: AgentEvents): Promise<ChatResult
   try {
     const r = await chat(
       [
-        { role: "system", content: SEARCH_SYS },
+        { role: "system", content: `${SEARCH_SYS}\n\n${today()}` },
         { role: "user", content: query },
       ],
       settings.model,
+      // no JSON mode here: providers reject web search combined with response_format
       { webSearch: true }
     );
     let parsed: { say?: string; table?: unknown; detail?: unknown };
@@ -278,19 +384,20 @@ async function webSearch(query: string, events: AgentEvents): Promise<ChatResult
   }
 }
 
-const CREATE_VERB = /\b(make|create|draw|build|generate|show me|give me|visuali[sz]e)\b/i;
+const CREATE_VERB = /\b(make|create|draw|build|generate|show me|give me|visuali[sz]e|lag|tegn|bygg|generer|vis meg|gi meg|visualiser)\b/i;
 
 const SEARCH_INTENT =
-  /\b(stock|price|weather|news|latest|today|right now|current|score|rate)\b/i;
+  /\b(stock|price|weather|news|latest|today|right now|current|score|rate|aksje|pris|kurs|vær|været|nyheter|siste|i dag|akkurat nå|resultat|rente)\b/i;
 
 const VISUAL_INTENT =
-  /\b(mermaid|diagram|flowchart|mindmap|sequence|timeline|chart|graph|visuali[sz]ation)\b/i;
+  /\b(mermaid|diagram|flowchart|mindmap|sequence|timeline|chart|graph|visuali[sz]ation|flytskjema|tankekart|tidslinje|graf|visualisering)/i;
 
 const IMAGE_INTENT =
-  /\b(draw|paint|sketch|generate|create|make|render|visualize|show)\b[\s\S]*\b(image|picture|photo|illustration|logo|drawing|painting|art|poster|icon)\b/i;
+  /\b(draw|paint|sketch|generate|create|make|render|visualize|show|tegn|mal|skisser|generer|lag|vis)\b[\s\S]*\b(image|picture|photo|illustration|logo|drawing|painting|art|poster|icon|bilde|foto|illustrasjon|tegning|maleri|kunst|plakat|ikon)/i;
 
 // verbs that unambiguously mean "make a picture", even without an image noun
-const STRONG_IMAGE_VERB = /\b(paint|sketch|illustrate)\b/i;
+// ("mal" is left out: in Norwegian it is just as often "template")
+const STRONG_IMAGE_VERB = /\b(paint|sketch|illustrate|skisser|illustrer)\b/i;
 
 /** One image-model call, visualized as its own orbiting sub-agent.
  *  With sourceImage set, the model edits/inpaints that image instead of starting fresh. */
@@ -315,12 +422,40 @@ async function generateImage(
       { imageOutput: true }
     );
     if (!r.images.length) {
-      return { text: r.text || "The image model returned nothing visible.", images: [] };
+      return { text: r.text || "Bildemodellen returnerte ikke noe synlig.", images: [] };
     }
-    return { text: caption || r.text || "Here is what I made.", images: r.images };
+    return { text: caption || r.text || "Her er det jeg laget.", images: r.images };
   } finally {
     events.onDone(id);
   }
+}
+
+// asks for a chart/graph — no leading \b, so compounds like "stolpediagram",
+// "linjegraf" and "kakediagram" match too
+const CHART_INTENT = /(diagram|graf|chart|graph|plot|kurve|visualiser|visualize)/i;
+
+/** A chart of live data: search first, then draw the chart from exactly those
+ *  figures. The figures stay behind the chart for "last ned". Falls back to the
+ *  search result's table if no chart comes back. */
+async function chartFromSearch(
+  transcript: string,
+  query: string,
+  events: AgentEvents
+): Promise<ChatResult> {
+  const found = await webSearch(`${query} (gi tallene som en tabell)`, events);
+  const data = found.detailTable ?? found.table;
+  if (!data?.rows.length) return found;
+  const rows = [data.headers, ...data.rows].map((r) => r.join(" | ")).join("\n");
+  const chart = await generateVisual(
+    "svg",
+    `${transcript}\n\nDraw the chart from exactly this data — it comes from a live web ` +
+      `search; do not invent, round away or add numbers. Labels and title in Norwegian bokmål.\n` +
+      `${data.title ? `Title: ${data.title}\n` : ""}${rows}`,
+    found.text,
+    events
+  );
+  if (!chart.visual || !/<svg/i.test(chart.visual.code)) return found;
+  return { ...chart, text: found.text, detailTable: data };
 }
 
 const EDIT_INTENT = /\b(recolor|repaint|restyle|inpaint|redraw|colori[sz]e)\b/i;
@@ -348,12 +483,12 @@ async function expandImagePrompt(
 }
 
 const LOOK_INTENT =
-  /\b(describe|look at|see)\s+me\b|\bwhat am i wearing\b|\bhow do i look\b|\bwhat('s| is| do you see) (behind|around) me\b/i;
+  /\b(describe|look at|see)\s+me\b|\bwhat am i wearing\b|\bhow do i look\b|\bwhat('s| is| do you see) (behind|around) me\b|\b(beskriv|se på|ser du) meg\b|\bhva har jeg på meg\b|\bhvordan ser jeg ut\b|\bhva (er|ser du) bak meg\b/i;
 
 const LOOK_SYS = `You are "Octa", a spoken voice assistant with one webcam frame of the
 user in front of you. Answer their request from what you actually see — be specific
 and warm (clothing colors, surroundings, expression), never invent details you can't
-see, and keep it conversational, under 60 words, plain text.`;
+see, and keep it conversational, under 60 words, plain text, in Norwegian bokmål.`;
 
 /** One vision call on a live camera frame, visualized as its own sub-agent. */
 async function lookAtUser(
@@ -363,7 +498,7 @@ async function lookAtUser(
 ): Promise<ChatResult> {
   const frame = ctx.captureFrame ? await ctx.captureFrame() : null;
   if (!frame) {
-    return { text: "I can't reach the camera right now — enable it in settings.", images: [] };
+    return { text: "Jeg når ikke kameraet nå — slå det på i innstillingene.", images: [] };
   }
   const id = `agent-look-${Date.now()}`;
   events.onSpawn(id, "looking");
@@ -396,20 +531,22 @@ export async function respond(
       return lookAtUser(transcript, events, ctx);
     }
     if (ctx.lastImage && EDIT_INTENT.test(transcript)) {
-      return generateImage(transcript, "Here is the edited image.", events, ctx.lastImage);
+      return generateImage(transcript, "Her er det redigerte bildet.", events, ctx.lastImage);
     }
     if (IMAGE_INTENT.test(transcript)) {
-      return generateImage(transcript, "Here is what I made.", events);
+      return generateImage(transcript, "Her er det jeg laget.", events);
     }
     if (VISUAL_INTENT.test(transcript)) {
       const kind = /\b(interactive|animated|data|chart|graph)\b/i.test(transcript) ? "svg" : "mermaid";
-      return generateVisual(kind, transcript, "Here is the diagram.", events);
+      return generateVisual(kind, transcript, "Her er diagrammet.", events);
     }
     if (SEARCH_INTENT.test(transcript)) {
-      return webSearch(transcript, events);
+      return CHART_INTENT.test(transcript)
+        ? chartFromSearch(transcript, transcript, events)
+        : webSearch(transcript, events);
     }
     return chat([
-      { role: "system", content: "You are 'Octa', a spoken voice assistant. Reply conversationally, plain text, under 80 words." },
+      { role: "system", content: "You are 'Octa', a spoken voice assistant. Reply conversationally in Norwegian bokmål, plain text, under 80 words." },
       ...history,
       { role: "user", content: transcript },
     ]);
@@ -425,24 +562,27 @@ export async function respond(
           : "No editable image is on screen; never use the imageEdit branch. ") +
         (ctx.captureFrame
           ? "The user's camera is available — use the look branch for requests about their appearance or surroundings."
-          : "No camera is available; never use the look branch."),
+          : "No camera is available; never use the look branch.") +
+        ` ${today()}`,
     },
     ...history,
     { role: "user", content: transcript },
-  ]);
+  ], settings.model, { json: true });
 
   let parsed: {
     answer?: string;
+    slide?: unknown;
     subtasks?: { label: string; prompt: string }[];
     image?: string;
     imageEdit?: string;
     visual?: { kind?: string; brief?: string };
     search?: string;
     look?: string;
+    tier?: string;
     caption?: string;
   };
   try {
-    parsed = JSON.parse(extractJson(routed.text));
+    parsed = liftSlide(JSON.parse(extractJson(routed.text)));
   } catch {
     // model ignored the protocol; still honor obvious paint/diagram requests
     if (
@@ -458,9 +598,13 @@ export async function respond(
     return routed; // treat its text as the answer
   }
 
+  if (parsed.tier === "smart" || parsed.tier === "fast") {
+    return { text: parsed.caption ?? "", images: [], tier: parsed.tier };
+  }
+
   if (parsed.imageEdit) {
     if (!ctx.lastImage) {
-      return { text: "There's no image on screen to edit yet.", images: [] };
+      return { text: "Det er ikke noe bilde på skjermen å redigere ennå.", images: [] };
     }
     return generateImage(parsed.imageEdit, parsed.caption ?? "", events, ctx.lastImage);
   }
@@ -475,7 +619,9 @@ export async function respond(
   }
 
   if (parsed.search) {
-    return webSearch(parsed.search, events);
+    return CHART_INTENT.test(transcript)
+      ? chartFromSearch(transcript, parsed.search, events)
+      : webSearch(parsed.search, events);
   }
 
   if (parsed.look) {
@@ -495,7 +641,11 @@ export async function respond(
       const kind = /\b(interactive|animated|data|chart|graph)\b/i.test(transcript) ? "svg" : "mermaid";
       return generateVisual(kind, transcript, parsed.answer ?? "", events);
     }
-    return { text: parsed.answer ?? routed.text, images: routed.images };
+    return {
+      text: parsed.answer ?? routed.text,
+      images: routed.images,
+      slide: validSlide(parsed.slide) ? cleanSlide(parsed.slide) : undefined,
+    };
   }
 
   const tasks = parsed.subtasks.slice(0, 4);
@@ -517,7 +667,7 @@ export async function respond(
     })
   );
 
-  return chat([
+  const synth = await chat([
     { role: "system", content: SYNTH_SYS },
     ...history,
     {
@@ -526,5 +676,6 @@ export async function respond(
         `Original question: ${transcript}\n\n` +
         results.map((r) => `## ${r.label}\n${r.text}`).join("\n\n"),
     },
-  ]);
+  ], settings.model, { json: true });
+  return slideResult(synth.text, synth.images);
 }

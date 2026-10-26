@@ -1,5 +1,6 @@
-import type { TableData } from "./openrouter";
+import type { SlideData, TableData } from "./openrouter";
 import { theme } from "./theme";
+import { drawIcon, isIcon } from "./icons";
 
 // While set, renderers use light (linen) tokens regardless of the UI theme —
 // used when re-rendering artifacts for the always-light PDF.
@@ -13,13 +14,17 @@ function pal() {
       dark: false,
       fg: "#0c1210",
       dim: "#8c8677",
+      muted: "#57534a",
       seal: "#1d4433",
       signal: "#d94018",
       ruleStrong: "rgba(12, 18, 16, 0.3)",
     };
   }
   const t = theme();
-  return { dark: t.dark, fg: t.fg, dim: t.dim, seal: t.seal, signal: t.signal, ruleStrong: t.ruleStrong };
+  // muted: secondary text that must stay readable on the frosted panel card
+  // (dim is too faint for body copy on white)
+  const muted = t.dark ? "#aaa496" : "#57534a";
+  return { dark: t.dark, fg: t.fg, dim: t.dim, muted, seal: t.seal, signal: t.signal, ruleStrong: t.ruleStrong };
 }
 
 /** Rasterizers that turn artifacts into canvases/images for 3D panel textures. */
@@ -166,7 +171,7 @@ export function createTableRenderer(t: TableData, scale = 2): PanelRender {
     for (const [c, h] of t.headers.entries()) {
       settled =
         drawStreamed(h.toUpperCase(), x, y + 14, 0.15, elapsed, {
-          fill: pal().dim,
+          fill: pal().muted,
           glow: 0,
           font: `12px ${mono}`,
           spacing: "2px",
@@ -193,7 +198,7 @@ export function createTableRenderer(t: TableData, scale = 2): PanelRender {
       for (const [c, cell] of row.entries()) {
         settled =
           drawStreamed(String(cell ?? ""), x, y + 22, rowStart + c * 0.05, elapsed, {
-            fill: c === 0 ? pal().dim : pal().fg,
+            fill: c === 0 ? pal().muted : pal().fg,
             glow: 0,
             font: `500 15px ${mono}`,
           }) && settled;
@@ -201,6 +206,163 @@ export function createTableRenderer(t: TableData, scale = 2): PanelRender {
       }
       y += rowH;
     }
+    return settled;
+  };
+
+  draw(0);
+  return { canvas, draw };
+}
+
+/** Greedy word wrap against the context's current font. */
+function wrapText(ctx: CanvasRenderingContext2D, text: string, maxW: number): string[] {
+  const lines: string[] = [];
+  let current = "";
+  for (const word of text.split(/\s+/).filter(Boolean)) {
+    const trial = current ? `${current} ${word}` : word;
+    if (ctx.measureText(trial).width > maxW && current) {
+      lines.push(current);
+      current = word;
+    } else {
+      current = trial;
+    }
+  }
+  if (current) lines.push(current);
+  return lines;
+}
+
+/**
+ * Keynote card: serif headline, an optional hero number in Signal orange,
+ * then numbered points — each element rises into place in sequence.
+ */
+export function createSlideRenderer(slide: SlideData, scale = 2): PanelRender {
+  const mono = "ui-monospace, Menlo, monospace";
+  const serif = 'Newsreader, Georgia, "Times New Roman", serif';
+  const W = 760;
+  const pad = 44;
+  const inner = W - pad * 2;
+  const numW = 56; // gutter for the 01 / 02 index
+
+  const meas = document.createElement("canvas").getContext("2d")!;
+  meas.font = `500 34px ${serif}`;
+  const headline = wrapText(meas, slide.headline, inner).slice(0, 3);
+  const points = slide.points.map((pt) => {
+    meas.font = `500 20px ${serif}`;
+    const title = wrapText(meas, pt.title, inner - numW);
+    meas.font = `400 15px ${serif}`;
+    const detail = pt.detail ? wrapText(meas, pt.detail, inner - numW) : [];
+    return { title, detail, icon: pt.icon, h: Math.max(64, 20 + title.length * 26 + detail.length * 21 + 18) };
+  });
+
+  const headH = headline.length * 42;
+  const statH = slide.stat ? 104 : 0;
+  const H = pad + 22 + headH + 26 + statH + points.reduce((a, p) => a + p.h, 0) + pad - 18;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(W * scale);
+  canvas.height = Math.round(H * scale);
+  const ctx = canvas.getContext("2d")!;
+
+  // each element fades and rises over 0.45s, starting at its own beat
+  const reveal = (elapsed: number, start: number) =>
+    Math.min(1, Math.max(0, (elapsed - start) / 0.45));
+  const ease = (p: number) => 1 - Math.pow(1 - p, 3);
+
+  const draw = (elapsed: number): boolean => {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.scale(scale, scale);
+    const c = pal();
+    let settled = true;
+    const at = (start: number) => {
+      const p = reveal(elapsed, start);
+      if (p < 1) settled = false;
+      ctx.globalAlpha = ease(p);
+      return (1 - ease(p)) * 10; // rise offset
+    };
+
+    let y = pad;
+    let beat = 0;
+
+    // kicker
+    let dy = at(beat);
+    ctx.font = `11px ${mono}`;
+    ctx.letterSpacing = "5px";
+    ctx.fillStyle = c.seal;
+    ctx.fillText(`KEY POINTS · ${String(points.length).padStart(2, "0")}`, pad, y + 10 + dy);
+    ctx.letterSpacing = "0px";
+    y += 22;
+
+    // headline
+    beat += 0.12;
+    dy = at(beat);
+    ctx.font = `500 34px ${serif}`;
+    ctx.fillStyle = c.fg;
+    for (const line of headline) {
+      y += 42;
+      ctx.fillText(line, pad, y - 8 + dy);
+    }
+    y += 26;
+
+    // hero number
+    if (slide.stat) {
+      beat += 0.25;
+      dy = at(beat);
+      ctx.font = `500 64px ${serif}`;
+      ctx.fillStyle = c.signal;
+      ctx.fillText(slide.stat.value, pad, y + 62 + dy);
+      const vw = ctx.measureText(slide.stat.value).width;
+      ctx.font = `11px ${mono}`;
+      ctx.letterSpacing = "3px";
+      ctx.fillStyle = c.muted;
+      for (const [i, line] of wrapText(ctx, slide.stat.label.toUpperCase(), inner - vw - 28).slice(0, 3).entries()) {
+        ctx.fillText(line, pad + vw + 24, y + 34 + i * 16 + dy);
+      }
+      ctx.letterSpacing = "0px";
+      y += statH;
+    }
+
+    // numbered points, each under a rule that sweeps in first
+    for (const [i, pt] of points.entries()) {
+      beat += 0.18;
+      ctx.globalAlpha = 1;
+      const lineP = reveal(elapsed, beat - 0.1);
+      if (lineP < 1) settled = false;
+      ctx.strokeStyle = c.ruleStrong;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(pad, y);
+      ctx.lineTo(pad + inner * ease(lineP), y);
+      ctx.stroke();
+
+      dy = at(beat);
+      // the lead point carries the Signal accent when there's no hero number
+      const mark = i === 0 && !slide.stat ? c.signal : c.seal;
+      if (isIcon(pt.icon)) {
+        drawIcon(ctx, pt.icon, pad, y + 22 + dy, 26, mark);
+      } else {
+        ctx.font = `12px ${mono}`;
+        ctx.letterSpacing = "2px";
+        ctx.fillStyle = mark;
+        ctx.fillText(String(i + 1).padStart(2, "0"), pad, y + 38 + dy);
+        ctx.letterSpacing = "0px";
+      }
+
+      let ty = y + 20;
+      ctx.font = `500 20px ${serif}`;
+      ctx.fillStyle = c.fg;
+      for (const line of pt.title) {
+        ty += 26;
+        ctx.fillText(line, pad + numW, ty - 6 + dy);
+      }
+      ctx.font = `400 15px ${serif}`;
+      ctx.fillStyle = c.muted;
+      for (const line of pt.detail) {
+        ty += 21;
+        ctx.fillText(line, pad + numW, ty - 2 + dy);
+      }
+      y += pt.h;
+    }
+    ctx.globalAlpha = 1;
     return settled;
   };
 

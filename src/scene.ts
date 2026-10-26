@@ -98,6 +98,9 @@ const OCTA_FRAG = /* glsl */ `
   }
 `;
 
+export type OctaShape = "octahedron" | "icosahedron";
+
+
 export class OctaScene {
   private renderer: THREE.WebGLRenderer;
   private scene = new THREE.Scene();
@@ -133,6 +136,8 @@ export class OctaScene {
   private satPalette = ["#1d4433", "#d94018", "#3a4044", "#4a9272"];
   private themeDark = false;
   private frameColor = new THREE.Color("#0c1210");
+  private backingColor = new THREE.Color("#ffffff");
+  private backingAlpha = 0.82; // backing opacity relative to the panel's own
   private clock = new THREE.Clock();
   // head-tracked parallax: targets set from face tracking, lerped per frame
   private parallax = { x: 0, y: 0, dolly: 0, tx: 0, ty: 0, tdolly: 0 };
@@ -181,14 +186,16 @@ export class OctaScene {
         uIntensity: { value: 1.0 },
       },
     });
-    this.octa.add(new THREE.Mesh(geo, this.octaMat));
+    this.octaBody = new THREE.Mesh(geo, this.octaMat);
+    this.octa.add(this.octaBody);
 
     this.edgeMat = new THREE.LineBasicMaterial({
       color: this.glowColor,
       transparent: true,
       opacity: 0.9,
     });
-    this.octa.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo), this.edgeMat));
+    this.octaEdges = new THREE.LineSegments(new THREE.EdgesGeometry(geo), this.edgeMat);
+    this.octa.add(this.octaEdges);
     this.scene.add(this.octa);
 
     // magic tail: onion-skin ghosts of the edge wireframe, lagging behind
@@ -287,8 +294,12 @@ export class OctaScene {
     (this.backdropMat.uniforms.uInk.value as THREE.Color).set(t.fg);
     (this.octaMat.uniforms.uBody.value as THREE.Color).set(t.octaBody);
     this.frameColor.set(t.frame);
+    // white frosted glass on linen; a lifted slate pane in the dark
+    this.backingColor.set(t.dark ? "#1a2029" : "#ffffff");
+    this.backingAlpha = t.dark ? 0.86 : 0.82;
     for (const p of this.panels.values()) {
       p.frameMat.color.set(t.frame);
+      p.backMat?.color.copy(this.backingColor);
       p.mat.color.setScalar(p.tone * this.panelToneScale(p.framed));
     }
     const c = new THREE.Color(this.stateColors[this.state]);
@@ -412,6 +423,51 @@ export class OctaScene {
 
   private pulseScale = { v: 1 };
 
+  // body shape mirrors the active brain: octahedron = fast, icosahedron = smart
+  private octaBody!: THREE.Mesh;
+  private octaEdges!: THREE.LineSegments;
+  private shape: OctaShape = "octahedron";
+  private shapeScale = { v: 1 };
+
+  /** Swap the body between octahedron and icosahedron: a quick squeeze, the
+   *  geometry swap at its tightest, then a spring back out — bouncier going
+   *  up to the smart brain, softer coming back down. */
+  setShape(shape: OctaShape, animate = true) {
+    if (shape === this.shape) return;
+    this.shape = shape;
+    const up = shape === "icosahedron";
+    const swap = () => {
+      // icosahedron reads smaller at the same circumradius — nudge it up
+      const geo = up ? new THREE.IcosahedronGeometry(1.1) : new THREE.OctahedronGeometry(1);
+      this.octaBody.geometry.dispose();
+      this.octaBody.geometry = geo;
+      this.octaEdges.geometry.dispose();
+      this.octaEdges.geometry = new THREE.EdgesGeometry(geo);
+      const ghostGeo = new THREE.EdgesGeometry(geo); // the onion-skin tail shares one
+      this.octaGhosts[0]?.geometry.dispose();
+      for (const ghost of this.octaGhosts) ghost.geometry = ghostGeo;
+    };
+    if (!animate) {
+      swap();
+      return;
+    }
+    gsap.killTweensOf(this.shapeScale);
+    gsap
+      .timeline()
+      .to(this.shapeScale, { v: up ? 0.55 : 0.72, duration: 0.22, ease: "power3.in", onComplete: swap })
+      .to(this.shapeScale, {
+        v: 1,
+        duration: up ? 1.5 : 1.0,
+        ease: up ? "elastic.out(1.2, 0.3)" : "elastic.out(0.9, 0.45)",
+      });
+    gsap.to(this.octa.rotation, {
+      y: `+=${up ? Math.PI * 0.75 : -Math.PI * 0.5}`,
+      duration: 1.2,
+      ease: "back.out(1.6)",
+    });
+    this.pulse(up ? 1 : 0.5);
+  }
+
   // --- sub-agent satellites: small shapes orbiting the octahedron ---
 
   private satellites = new Map<string, {
@@ -531,6 +587,8 @@ export class OctaScene {
     inner: THREE.Group;
     mat: THREE.MeshBasicMaterial;
     frameMat: THREE.LineBasicMaterial;
+    /** Frosted card behind line-work panels; its opacity follows mat's. */
+    backMat: THREE.MeshBasicMaterial | null;
     desc: string;
     width: number;
     height: number;
@@ -594,8 +652,23 @@ export class OctaScene {
       opacity: 0,
     });
     const inner = new THREE.Group();
-    inner.add(new THREE.Mesh(geo, mat));
+    inner.add(new THREE.Mesh(geo, mat)); // children[0]: the hit-test target
     inner.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo), frameMat));
+    // line-work (slides, tables, charts, notes) is mostly transparent canvas —
+    // a frosted card behind it keeps the octahedron and grid from bleeding through
+    let backMat: THREE.MeshBasicMaterial | null = null;
+    if (!framed) {
+      backMat = new THREE.MeshBasicMaterial({
+        color: this.backingColor.clone(),
+        transparent: true,
+        opacity: 0,
+        depthWrite: false,
+      });
+      // square corners: the SkyeTec line is sharp
+      const back = new THREE.Mesh(new THREE.PlaneGeometry(w + 0.16, h + 0.16), backMat);
+      back.position.z = -0.01;
+      inner.add(back);
+    }
     const group = new THREE.Group();
     group.add(inner);
 
@@ -607,7 +680,7 @@ export class OctaScene {
     const frameMax = framed ? 0.35 : 0;
     const focusOpacity = framed ? 0.9 : 0.96; // photos slightly translucent in focus
     this.panels.set(id, {
-      group, inner, mat, frameMat, desc, width: w, height: h, frameMax, focusOpacity,
+      group, inner, mat, frameMat, backMat, desc, width: w, height: h, frameMax, focusOpacity,
       tone, framed,
       focused: true,
       phase: Math.random() * Math.PI * 2,
@@ -786,6 +859,10 @@ export class OctaScene {
     gsap.to(p.group.scale, { x: 0.01, y: 0.01, z: 0.01, duration: 0.5, ease: "power3.in" });
     gsap.to(p.mat, {
       opacity: 0, duration: 0.5,
+      // out of the map now, so render() no longer drives the card — fade it here
+      onUpdate: () => {
+        if (p.backMat) p.backMat.opacity = p.mat.opacity * this.backingAlpha;
+      },
       onComplete: () => {
         this.scene.remove(p.group);
         p.group.traverse((o) => {
@@ -896,7 +973,7 @@ export class OctaScene {
         ? lv * 0.22
         : 0;
     const breathe = this.state === "thinking" ? Math.sin(t * 3.2) * 0.03 : 0;
-    const s = (p.scale + voiceScale + breathe) * this.pulseScale.v;
+    const s = (p.scale + voiceScale + breathe) * this.pulseScale.v * this.shapeScale.v;
     this.octa.scale.setScalar(s);
 
     this.octa.position.y = Math.sin(t * 1.1) * p.floatAmp;
@@ -911,6 +988,8 @@ export class OctaScene {
       panel.inner.position.x = v.x;
       panel.inner.position.y = v.y + Math.sin(t * 1.05 + panel.phase) * 0.035;
       panel.inner.scale.setScalar(v.zoom);
+      // the card fades with its panel through every focus/shelf/remove tween
+      if (panel.backMat) panel.backMat.opacity = panel.mat.opacity * this.backingAlpha;
       if (panel.animate && !panel.animDone) {
         panel.animDone = panel.animate(t - panel.animStart);
         if (panel.mat.map) panel.mat.map.needsUpdate = true;
@@ -992,6 +1071,9 @@ export class OctaScene {
     this.bloom.strength = this.themeDark
       ? 0.25 + p.glowStrength * 0.2 + lv * 0.25
       : 0.08 + p.glowStrength * 0.08 + lv * 0.1;
+    // on linen nothing should glow past white — otherwise the frosted panel
+    // cards halo and wash out the text on them
+    this.bloom.threshold = this.themeDark ? 0.85 : 1.0;
 
     this.composer.render();
   }

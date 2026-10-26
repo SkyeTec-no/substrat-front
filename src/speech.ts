@@ -54,7 +54,7 @@ export class Recognizer {
     return "SpeechRecognition" in window || "webkitSpeechRecognition" in window;
   }
 
-  start(lang = "en-US") {
+  start(lang = "nb-NO") {
     const w = window as unknown as {
       SpeechRecognition?: RecognitionCtor;
       webkitSpeechRecognition?: RecognitionCtor;
@@ -101,21 +101,20 @@ export class Speaker {
       const saved = voices.find((v) => v.name === settings.voice);
       if (saved) return saved;
     }
-    // Daniel first — the clipped, slightly robotic voice this UI shipped with
-    for (const name of ["Daniel", "Google UK English Male", "Samantha", "Google US English"]) {
-      const v = voices.find((v) => v.name === name);
+    // Octa speaks Norwegian: macOS ships Nora (nb-NO); Chrome may add a Google voice
+    for (const name of ["Nora", "Google norsk bokmål", "Henrik"]) {
+      const v = voices.find((v) => v.name === name || v.name.startsWith(`${name} (`));
       if (v) return v;
     }
-    return (
-      voices.find((v) => v.default && v.lang.startsWith("en")) ??
-      voices.find((v) => v.lang.startsWith("en"))
-    );
+    const norwegian = (v: SpeechSynthesisVoice) => /^(nb|no|nn)\b/i.test(v.lang);
+    return voices.find((v) => v.default && norwegian(v)) ?? voices.find(norwegian);
   }
 
   /** Speaks text; onWord fires per word boundary, resolves when done. */
   speak(text: string, onWord: () => void): Promise<void> {
     return new Promise((resolve) => {
       const u = new SpeechSynthesisUtterance(text);
+      u.lang = "nb-NO";
       u.rate = 1.0;
       u.pitch = 0.9;
 

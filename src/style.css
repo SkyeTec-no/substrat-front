@@ -10,6 +10,13 @@
   --rule: rgba(12, 18, 16, 0.18);
   --rule-strong: rgba(12, 18, 16, 0.3);
   --overlay: rgba(229, 232, 222, 0.96);
+  /* meeting participants — one tint per tracked person */
+  --person-0: #1d4433;
+  --person-1: #d94018;
+  --person-2: #2f5f8a;
+  --person-3: #a2780e;
+  --person-4: #7a4691;
+  --person-5: #1f7f80;
 }
 
 :root.dark {
@@ -23,6 +30,12 @@
   --rule: rgba(242, 236, 224, 0.1);
   --rule-strong: rgba(242, 236, 224, 0.3);
   --overlay: rgba(11, 14, 18, 0.96);
+  --person-0: #4a9272;
+  --person-1: #e2603a;
+  --person-2: #6a9ccc;
+  --person-3: #d1a840;
+  --person-4: #a97cc0;
+  --person-5: #4fb3b3;
 }
 
 * {
@@ -240,6 +253,7 @@ body {
 }
 
 .hand-dot {
+  --who: var(--accent);
   position: fixed;
   left: 0;
   top: 0;
@@ -250,18 +264,260 @@ body {
   pointer-events: none;
   z-index: 4;
   opacity: 0;
-  border: 1.5px solid var(--accent);
-  background: rgba(29, 68, 51, 0.15);
-  transition: opacity 0.25s, background 0.2s, border-color 0.2s;
+  border: 1.5px solid var(--who);
+  background: color-mix(in srgb, var(--who) 15%, transparent);
+  transition: opacity 0.25s, background 0.2s, border-color 0.2s, scale 0.25s;
 }
 
 .hand-dot.visible {
   opacity: 0.9;
 }
 
+/* hands of people without the floor: seen, but not steering */
+.hand-dot.passive.visible {
+  opacity: 0.35;
+  scale: 0.7;
+  border-style: dashed;
+}
+
+/* asking for the floor */
+.hand-dot.raised.visible {
+  opacity: 0.9;
+  scale: 1.4;
+  background: color-mix(in srgb, var(--who) 45%, transparent);
+}
+
 .hand-dot.pinch {
   border-color: var(--signal);
   background: rgba(217, 64, 24, 0.85);
+}
+
+#camview {
+  position: fixed;
+  left: 1.5rem;
+  bottom: 1.5rem;
+  z-index: 5;
+  width: 320px;
+  border: 1px solid var(--rule-strong);
+  background: var(--panel);
+  pointer-events: none;
+  display: none;
+}
+
+#camview.visible {
+  display: block;
+}
+
+/* participant strip — one sharp square per person the camera sees.
+   A big thin numeral carries identity; status sits quietly in the corners. */
+#participants {
+  position: fixed;
+  right: 1.5rem;
+  bottom: 1.5rem;
+  z-index: 5;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  max-width: calc(100vw - 3rem);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.4s;
+}
+
+#participants.visible {
+  opacity: 1;
+}
+
+.pt {
+  --who: var(--accent);
+  position: relative;
+  width: 68px;
+  height: 68px;
+  /* borderless frosted tile — the fill alone sets it off the scene */
+  background: color-mix(in srgb, var(--fg) 6%, color-mix(in srgb, var(--panel) 70%, transparent));
+  backdrop-filter: blur(14px) saturate(1.3);
+  animation: pt-in 0.5s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  transition: background 0.35s;
+}
+
+/* identity line: grows from the left when the person faces Octa */
+.pt::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 2px;
+  width: 100%;
+  background: var(--who);
+  transform: scaleX(0.18);
+  transform-origin: left;
+  transition: transform 0.45s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.pt.looking::before,
+.pt.holder::before {
+  transform: scaleX(1);
+}
+
+.pt.holder {
+  background: color-mix(in srgb, var(--who) 16%, color-mix(in srgb, var(--panel) 80%, transparent));
+}
+
+@keyframes pt-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+
+.pt-num {
+  position: absolute;
+  left: 9px;
+  bottom: 7px;
+  font-family: Newsreader, Georgia, "Times New Roman", serif;
+  font-size: 34px;
+  font-weight: 300;
+  line-height: 1;
+  letter-spacing: -0.02em;
+  color: var(--fg);
+  opacity: 0.38;
+  transition: opacity 0.35s;
+}
+
+.pt.looking .pt-num,
+.pt.holder .pt-num {
+  opacity: 1;
+}
+
+.pt svg {
+  display: block;
+  width: 13px;
+  height: 13px;
+}
+
+.pt-gaze {
+  position: absolute;
+  left: 8px;
+  top: 8px;
+  color: var(--dim);
+  transition: color 0.3s;
+}
+
+.pt-gaze .on { display: none; }
+.pt.looking .pt-gaze { color: var(--who); }
+.pt.looking .pt-gaze .on { display: block; }
+.pt.looking .pt-gaze .off { display: none; }
+
+.pt-hand {
+  position: absolute;
+  right: 7px;
+  top: 7px;
+  color: var(--signal);
+  opacity: 0;
+  transform: translateY(4px);
+  transition: opacity 0.25s, transform 0.25s;
+}
+
+.pt.hand-up .pt-hand {
+  opacity: 1;
+  transform: none;
+  animation: pt-raise 1s ease-in-out 0.25s infinite;
+}
+
+@keyframes pt-raise {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-2px); }
+}
+
+/* lips moving: three hairline bars, top right under the hand slot */
+.pt-meter {
+  position: absolute;
+  right: 9px;
+  bottom: 10px;
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 9px;
+}
+
+.pt-meter i {
+  width: 2px;
+  height: 2px;
+  background: var(--rule-strong);
+  transition: background 0.2s;
+}
+
+.pt.talking .pt-meter i {
+  background: var(--who);
+  animation: pt-talk 0.45s ease-in-out infinite alternate;
+}
+
+.pt.talking .pt-meter i:nth-child(2) { animation-delay: 0.15s; }
+.pt.talking .pt-meter i:nth-child(3) { animation-delay: 0.3s; }
+
+@keyframes pt-talk {
+  from { height: 2px; }
+  to { height: 9px; }
+}
+
+/* floor tag: hangs just above the square, only when it says something */
+.pt-role {
+  position: absolute;
+  left: 0;
+  bottom: 100%;
+  margin-bottom: 4px;
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 0.56rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--dim);
+  white-space: nowrap;
+}
+
+.pt.holder .pt-role { color: var(--who); }
+
+#meeting {
+  position: fixed;
+  top: 1.35rem;
+  left: 50%;
+  translate: -50% 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 0.66rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--dim);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.4s;
+}
+
+#meeting.visible {
+  opacity: 1;
+}
+
+#meeting .who {
+  --who: var(--accent);
+  padding: 0.2rem 0.5rem;
+  border: 1px solid var(--who);
+  color: var(--who);
+  letter-spacing: 0.1em;
+}
+
+#meeting .who.holder {
+  background: var(--who);
+  color: var(--bg);
+}
+
+#meeting .who.queued {
+  opacity: 0.7;
+}
+
+#meeting .label + .label {
+  text-transform: none;
+  letter-spacing: 0.04em;
 }
 
 #settings-btn {
