@@ -9,7 +9,7 @@ import { respond, keynote, repairMermaid, generateReport, generateCompliments, g
 import { remember, clearHistory } from "./history";
 import { renderMermaidSvg } from "./visuals";
 import { isDownloadCommand, downloadArtifacts } from "./download";
-import { tierCommand, addressesOcta, isDeictic, zoomCommand, findPanel, isRecallCommand, isDismissCommand, isDismissAll, isOpenCommand, isShelveCommand, isNoteCommand, isStopNotesCommand, isReportCommand } from "./commands";
+import { tierCommand, isShelveAll, addressesOcta, isDeictic, zoomCommand, findPanel, isRecallCommand, isDismissCommand, isDismissAll, isOpenCommand, isShelveCommand, isNoteCommand, isStopNotesCommand, isReportCommand } from "./commands";
 import { buildReportPdf, type ReportArtifact } from "./report";
 import { loadImage, svgToCanvas, createTableRenderer, createWipeRenderer, createSlideRenderer, noteToCanvas } from "./panels";
 import { GestureControl, captureCameraFrame, type HandState, type MeetingState } from "./gestures";
@@ -788,6 +788,16 @@ async function converse(opts: { wakeOnly?: boolean; candidate?: number; given?: 
   }
 
   if (isShelveCommand(heard)) {
+    if (isShelveAll(heard)) {
+      if (!scene.focusedPanelId()) {
+        await localReply("Alt ligger allerede bak.");
+        return;
+      }
+      scene.shelvePanels();
+      sound?.ping(996, 0.06);
+      await localReply(pickLine(["Lagt bak.", "Alt i hylla.", "Ryddet."]));
+      return;
+    }
     const id = resolvePanel(heard, { fallback: "focused" });
     if (id) {
       scene.shelfPanel(id);

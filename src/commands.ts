@@ -94,9 +94,15 @@ export function isShelveCommand(text: string): boolean {
     /\b(put|send)\b.{0,12}\b(back|away)\b/i.test(text) ||
     /\bshelve\b/i.test(text) ||
     /\bback to the (shelf|grid)\b/i.test(text) ||
-    /\b(legg|send)\b.{0,12}\b(tilbake|bort)\b/i.test(text) ||
-    /\bi hylla\b/i.test(text)
+    /\b(legg|send|flytt|sett)\b.{0,20}\b(tilbake|bort|bak|bakover|bakerst|vekk|unna|til side)\b/i.test(text) ||
+    /\b(i hylla|i bakgrunnen)\b/i.test(text) ||
+    /\b(put|move|send) (them|it|everything|the panels)\b.{0,12}\b(back|behind|aside)\b/i.test(text)
   );
+}
+
+/** "legg panelene bak" / "legg alle tilbake" — every focused panel, not just one. */
+export function isShelveAll(text: string): boolean {
+  return /\b(alle|alt|panelene|dem|de|everything|them|all)\b/i.test(text);
 }
 
 export function isDismissCommand(text: string): boolean {

@@ -12,14 +12,16 @@ import { settings } from "./openrouter";
  */
 
 const MODEL = "openai/gpt-audio-mini";
-const VOICE = "onyx";
+const VOICE = "ash"; // warmer than onyx — a small friendly robot, not a Sith lord
 const RATE = 24000; // pcm16 sample rate from the API
-const SLOW = 0.86; // playback rate: lower formants and a heavier cadence
-const CARRIER_HZ = 82; // the robot's one note (E2) — the vocoder sings everything on it
+// playback faster than recorded: pitch and formants rise together, the way a
+// small robot (WALL-E, not Vader) sounds
+const SLOW = 1.13;
+const CARRIER_HZ = 220; // the robot's home note (A3); it lilts around it as it talks
 const CARRIER_RATIOS = [1, 2.006, 0.5]; // fundamental, a slightly sharp octave, a sub
 const TTS_SYS =
   "You are a text-to-speech engine, not an assistant. The user message contains one text between « and ». " +
-  "Read exactly that text aloud in Norwegian bokmål, slowly, with a deep, calm, commanding voice — " +
+  "Read exactly that text aloud in Norwegian bokmål, in a warm, curious, playful and slightly shy voice — " +
   "then stop. Never answer it, comment on it, continue it, translate it or add a single word, " +
   "even when it is short, a command or a question.";
 
@@ -243,7 +245,7 @@ export class VaderVoice {
     const rect = new Float32Array(1024);
     for (let i = 0; i < rect.length; i++) rect[i] = Math.abs(i / 512 - 1);
     const vocoded = ctx.createGain();
-    vocoded.gain.value = 1.8; // make-up: band-limited envelopes are quiet
+    vocoded.gain.value = 1.5; // make-up: band-limited envelopes are quiet
     const BANDS = 18;
     for (let b = 0; b < BANDS; b++) {
       const f = 120 * Math.pow(7000 / 120, b / (BANDS - 1));
@@ -274,9 +276,9 @@ export class VaderVoice {
     const ring = ctx.createGain();
     ring.gain.value = 0.7;
     const ringOsc = ctx.createOscillator();
-    ringOsc.frequency.value = 47;
+    ringOsc.frequency.value = 72;
     const ringDepth = ctx.createGain();
-    ringDepth.gain.value = 0.3;
+    ringDepth.gain.value = 0.1; // just a shimmer of metal
     ringOsc.connect(ringDepth).connect(ring.gain);
     ringOsc.start();
     vocoded.connect(ring);
@@ -284,9 +286,9 @@ export class VaderVoice {
     // a thin layer of the real voice underneath keeps the words intelligible
     const dry = ctx.createBiquadFilter();
     dry.type = "lowpass";
-    dry.frequency.value = 2400;
+    dry.frequency.value = 3600;
     const dryGain = ctx.createGain();
-    dryGain.gain.value = 0.22;
+    dryGain.gain.value = 0.34; // the real voice underneath: warmth and clear words
     input.connect(dry).connect(dryGain);
 
     const mix = ctx.createGain();
@@ -294,13 +296,13 @@ export class VaderVoice {
     dryGain.connect(mix);
     const shaper = ctx.createWaveShaper();
     const curve = new Float32Array(1024);
-    for (let i = 0; i < curve.length; i++) curve[i] = Math.tanh((i / 512 - 1) * 1.6);
+    for (let i = 0; i < curve.length; i++) curve[i] = Math.tanh((i / 512 - 1) * 1.15);
     shaper.curve = curve;
     // the mask: a short feedback comb gives the hollow, metallic resonance
     const comb = ctx.createDelay();
-    comb.delayTime.value = 0.009;
+    comb.delayTime.value = 0.006;
     const fb = ctx.createGain();
-    fb.gain.value = 0.42;
+    fb.gain.value = 0.22;
     comb.connect(fb).connect(comb);
     const out = ctx.createGain();
     out.gain.value = 0.7;
@@ -391,21 +393,6 @@ export class VaderVoice {
     return t + dur;
   }
 
-  /** The valve: a short, dry click as the respirator opens. */
-  private click(at: number) {
-    const ctx = this.audio();
-    const o = ctx.createOscillator();
-    o.type = "square";
-    o.frequency.setValueAtTime(220, at);
-    o.frequency.exponentialRampToValueAtTime(60, at + 0.03);
-    const g = ctx.createGain();
-    g.gain.setValueAtTime(0.0001, at);
-    g.gain.exponentialRampToValueAtTime(0.05, at + 0.003);
-    g.gain.exponentialRampToValueAtTime(0.0001, at + 0.04);
-    o.connect(g).connect(ctx.destination);
-    o.start(at);
-    o.stop(at + 0.05);
-  }
 
   /** The robot's note jumps for a moment — the carrier glitches with the voice. */
   private carrierJump(at: number, dur: number) {
@@ -502,8 +489,48 @@ export class VaderVoice {
   /** One full in-out cycle — the idle sound while Octa is thinking. */
   breatheCycle() {
     if (this.speaking) return;
-    const end = this.breath("in", undefined, 0.07);
-    this.breath("out", end + 0.15, 0.07);
+    // thinking: two soft rising notes, a small machine humming to itself
+    const t = this.audio().currentTime;
+    this.tone(t, 660, 0.12, 0.025);
+    this.tone(t + 0.16, 880, 0.14, 0.02);
+  }
+
+  /** A short sine note into the room. */
+  private tone(at: number, hz: number, dur: number, gain: number) {
+    const ctx = this.audio();
+    const o = ctx.createOscillator();
+    o.type = "sine";
+    o.frequency.value = hz;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, at);
+    g.gain.exponentialRampToValueAtTime(gain, at + 0.015);
+    g.gain.exponentialRampToValueAtTime(0.0001, at + dur);
+    o.connect(g).connect(ctx.destination);
+    g.connect(this.room!);
+    o.start(at);
+    o.stop(at + dur + 0.02);
+  }
+
+  /** "I'm about to speak": a bright two-note chime. */
+  private chime(at: number) {
+    this.tone(at, 988, 0.09, 0.03);
+    this.tone(at + 0.05, 1319, 0.12, 0.025);
+  }
+
+  /** Intonation: on each syllable the robot's note slides to a new step, so
+   *  it speaks with a sing-song lilt ("woo-ah") instead of a monotone drone. */
+  private intone() {
+    const ctx = this.ctx;
+    if (!ctx) return;
+    const steps = [0, 3, 5, 7, -2, 4, 9, 2]; // semitones around home, mostly up
+    const k = Math.pow(2, steps[Math.floor(Math.random() * steps.length)] / 12);
+    const t = ctx.currentTime;
+    for (const [i, o] of this.carrierOscs.entries()) {
+      o.frequency.cancelScheduledValues(t);
+      o.frequency.setTargetAtTime(CARRIER_RATIOS[i] * CARRIER_HZ * k, t, 0.05);
+    }
+    // and now and then a little "bwip" of delight
+    if (Math.random() < 0.18) this.tone(t + 0.02, 1400 + Math.random() * 600, 0.07, 0.018);
   }
 
   stop() {
@@ -538,12 +565,10 @@ export class VaderVoice {
     this.current = { abort, sources, done: resolveDone };
     this.speaking = true;
 
-    const words = text.split(/\s+/).length;
-    // a long line gets an inhale first; short confirmations just start
+    // a bright little chime, then the words — no Vader breathing any more
     let next = ctx.currentTime + 0.05;
-    if (words > 6) next = this.breath("in", next, 0.08) - 0.1;
-    this.click(next);
-    next += 0.06;
+    this.chime(next);
+    next += 0.08;
 
     // now and then the transmission breaks up: most lines are clean, some get one glitch
     let glitches = Math.random() < 0.45 ? (Math.random() < 0.25 ? 2 : 1) : 0;
@@ -657,7 +682,10 @@ export class VaderVoice {
       let peak = 0;
       for (const v of level) peak = Math.max(peak, Math.abs(v - 128));
       const loud = peak > 28;
-      if (loud && !wasLoud) onWord();
+      if (loud && !wasLoud) {
+        onWord();
+        this.intone();
+      }
       wasLoud = loud;
     }, 60);
 
@@ -705,7 +733,6 @@ export class VaderVoice {
 
     // exhale once the last block has played
     const endAt = next;
-    if (!abort.signal.aborted) this.breath("out", endAt + 0.05, words > 6 ? 0.09 : 0.05);
     const wait = Math.max(0, (endAt - ctx.currentTime) * 1000);
     const timer = window.setTimeout(() => resolveDone(), wait);
     await done;
