@@ -90,6 +90,24 @@ async function cachePut(text: string, pcm: Float32Array) {
   }
 }
 
+/** Sample offset of a vowel in this PCM (loud, voiced = few zero crossings),
+ *  picked at random among the vowel frames; null if there isn't one. */
+function findVowel(pcm: Float32Array): number | null {
+  const F = 480; // 20 ms at 24 kHz
+  const frames: { at: number; rms: number; zcr: number }[] = [];
+  for (let o = 0; o + F <= pcm.length; o += F) {
+    let e = 0, z = 0;
+    for (let i = o; i < o + F; i++) {
+      e += pcm[i] * pcm[i];
+      if (i > o && (pcm[i] >= 0) !== (pcm[i - 1] >= 0)) z++;
+    }
+    frames.push({ at: o, rms: Math.sqrt(e / F), zcr: z / F });
+  }
+  const loudest = Math.max(0, ...frames.map((f) => f.rms));
+  const vowels = frames.filter((f) => f.rms > loudest * 0.55 && f.rms > 0.03 && f.zcr < 0.1);
+  return vowels.length ? vowels[Math.floor(Math.random() * vowels.length)].at : null;
+}
+
 function decodePcm16(b64: string): Float32Array {
   const bin = atob(b64);
   const out = new Float32Array(bin.length >> 1);
@@ -593,7 +611,20 @@ export class VaderVoice {
       // never on the first block (let the line land first), only on blocks long enough to cut
       const glitch = glitches > 0 && blockNo++ > 0 && len > 0.2 && Math.random() < 0.35;
       if (!glitch) {
-        play(b, next, 0, len, this.input!);
+        const src = play(b, next, 0, len, this.input!);
+        // micro-glitches ride on vowels: a quick warble, or the robot's note
+        // jumping for a beat — roughly every other block
+        const vowel = Math.random() < 0.5 ? findVowel(pcm) : null;
+        if (vowel !== null) {
+          const at = next + vowel / RATE / SLOW;
+          if (Math.random() < 0.5) {
+            const curve = new Float32Array(24).map((_, i) => SLOW * (1 + 0.09 * Math.sin((i / 23) * Math.PI * 4)));
+            src.playbackRate.setValueCurveAtTime(curve, at, 0.11);
+          } else {
+            this.carrierJump(at, 0.09);
+            window.setTimeout(() => this.onGlitch(0.3, 110), Math.max(0, (at - ctx.currentTime) * 1000));
+          }
+        }
         next += len / SLOW;
         return;
       }
