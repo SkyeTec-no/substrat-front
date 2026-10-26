@@ -1,4 +1,4 @@
-import { FilesetResolver, GestureRecognizer, FaceLandmarker, PoseLandmarker } from "@mediapipe/tasks-vision";
+import { FilesetResolver, GestureRecognizer, FaceLandmarker, PoseLandmarker, type GestureRecognizerResult } from "@mediapipe/tasks-vision";
 import { Floor, type FloorState } from "./floor";
 
 /**
@@ -64,7 +64,12 @@ export interface GestureEvents {
 const PINCH_ON = 0.38; // thumb-index distance / hand size — with hysteresis
 const PINCH_OFF = 0.52;
 
-const MAX_HANDS = 8;
+const MAX_HANDS = 4;
+// Vision runs at a fixed pace, not per display frame (a 120 Hz screen would
+// double the work), and alternates: hands on one tick, people + faces on the next.
+const VISION_MS = 50; // 20 ticks a second → 10 Hz hands, 10 Hz people/lips
+const HAND_INPUT_W = 960; // the hand model gets a downscaled frame
+const POSE_INPUT = 512; // pose tiles are downscaled to at most this (px, longest side)
 const PERSON_TTL = 2500; // ms a person may go unseen before they're dropped
 const CROP = 256; // face crops are analysed at this size (px, square)
 const FACE_FRESH = 500; // ms a face-mesh read stays the authority on gaze
@@ -102,6 +107,9 @@ interface Person {
   faceAt: number; // last time the face mesh read this person's face
   raiseSince: number; // wrist above the head (from the pose), held
   raiseFired: boolean;
+  /** A still of their face, taken the moment they faced the camera — kept for the tile. */
+  portrait: HTMLCanvasElement | null;
+  portraitAt: number;
   /** Lip gap / face height per face frame, with whether the lips were moving
    *  and the face was turned to Octa then. */
   mouth: { t: number; gap: number; moving: boolean; looking: boolean }[];
@@ -270,6 +278,10 @@ export class GestureControl {
   private crossedFired = false;
 
   private frameCount = 0;
+  private lastTick = 0;
+  private poseTicks = 0;
+  private handCanvas: HTMLCanvasElement | null = null;
+  private lastHands: GestureRecognizerResult | null = null;
   private earSince = 0;
   private earFired = false;
   private talkSince = 0; // floor holder: lips moving while facing Octa since…
@@ -361,22 +373,34 @@ export class GestureControl {
     };
   }
 
-  /** Paint a person's face (head and a little shoulder) into a canvas, mirrored
-   *  like everything else on screen. False if they're not in view. */
+  /** Copy a person's kept portrait into a canvas. False until one was taken. */
   drawFace(id: number, canvas: HTMLCanvasElement): boolean {
     const p = this.persons.find((q) => q.id === id);
-    const video = this.video;
-    if (!p || !video || video.readyState < 2) return false;
+    if (!p?.portrait) return false;
+    // only repaint when the portrait changed
+    const stamp = String(p.portraitAt);
+    if (canvas.dataset.stamp !== stamp) {
+      canvas.dataset.stamp = stamp;
+      canvas.getContext("2d")!.drawImage(p.portrait, 0, 0, canvas.width, canvas.height);
+    }
+    return true;
+  }
+
+  /** Head and a little shoulder, mirrored like everything else on screen. */
+  private snapPortrait(p: Person, now: number) {
+    const video = this.video!;
     const side = Math.max(p.w * 2.2, 72);
     const sx = Math.max(0, Math.min(video.videoWidth - side, p.cx - side / 2));
     const sy = Math.max(0, Math.min(video.videoHeight - side, p.cy - side * 0.45));
-    const ctx = canvas.getContext("2d")!;
+    const c = (p.portrait ??= document.createElement("canvas"));
+    c.width = c.height = 160;
+    const ctx = c.getContext("2d")!;
     ctx.save();
-    ctx.translate(canvas.width, 0);
+    ctx.translate(c.width, 0);
     ctx.scale(-1, 1);
-    ctx.drawImage(video, sx, sy, side, side, 0, 0, canvas.width, canvas.height);
+    ctx.drawImage(video, sx, sy, side, side, 0, 0, c.width, c.height);
     ctx.restore();
-    return true;
+    p.portraitAt = now;
   }
 
   /** Whether the floor holder's lips moved since `since` (performance.now()).
@@ -451,14 +475,18 @@ export class GestureControl {
       this.tiles = tiles;
       this.tileCanvas ??= document.createElement("canvas");
     }
-    for (let k = 0; k < 2; k++) {
+    {
       const tile = this.tiles[this.tileTurn++ % this.tiles.length];
       const cv = this.tileCanvas!;
-      if (cv.width !== tile.w || cv.height !== tile.h) {
-        cv.width = tile.w;
-        cv.height = tile.h;
+      // the model sees ~256 px anyway: shrink the tile before handing it over
+      const k = Math.min(1, POSE_INPUT / Math.max(tile.w, tile.h));
+      const cw = Math.round(tile.w * k);
+      const ch = Math.round(tile.h * k);
+      if (cv.width !== cw || cv.height !== ch) {
+        cv.width = cw;
+        cv.height = ch;
       }
-      cv.getContext("2d")!.drawImage(this.video!, tile.x, tile.y, tile.w, tile.h, 0, 0, tile.w, tile.h);
+      cv.getContext("2d")!.drawImage(this.video!, tile.x, tile.y, tile.w, tile.h, 0, 0, cw, ch);
       for (const lm of this.poseLandmarker!.detect(cv).landmarks) {
         this.seePose(
           lm.map((l) => ({ x: tile.x + l.x * tile.w, y: tile.y + l.y * tile.h, v: l.visibility ?? 1 })),
@@ -475,7 +503,8 @@ export class GestureControl {
     const holder = this.persons.find((p) => p.id === this.floor?.holder);
     // (a person is re-seen once per tile sweep, ~0.25 s — "recent" means within 1 s)
     const others = this.persons.filter((p) => p !== holder && now - p.lastSeen < 1000);
-    const pick = others.length ? others[this.cropTurn++ % others.length] : undefined;
+    // the holder's lips every tick; everyone else takes turns every other tick
+    const pick = others.length && this.poseTicks++ % 2 === 0 ? others[this.cropTurn++ % others.length] : undefined;
     for (const p of [holder, pick]) if (p && now - p.lastSeen < 1000) this.readFace(p, now);
   }
 
@@ -524,6 +553,7 @@ export class GestureControl {
       best = {
         id: this.nextPersonId++, cx, cy, w, h, top: 0, ears, wrists, lastSeen: now,
         poseFacing, faceAt: 0, raiseSince: 0, raiseFired: false,
+        portrait: null, portraitAt: 0,
         mouth: [], lookEma: 0, looking: false,
       };
       this.persons.push(best);
@@ -575,7 +605,11 @@ export class GestureControl {
     const recent = p.mouth.filter((m) => now - m.t < MOUTH_WINDOW).map((m) => m.gap);
     recent.push(gap);
     const moving = Math.max(...recent) - Math.min(...recent) > MOUTH_MOVING;
-    this.updateLook(p, facing(lm));
+    const facingNow = facing(lm);
+    this.updateLook(p, facingNow);
+    // portrait: snap one the moment they look straight at the camera, keep it
+    // (re-taken after 10 min, so it follows people who change seats or light)
+    if (facingNow && p.looking && (!p.portrait || now - p.portraitAt > 600_000)) this.snapPortrait(p, now);
     p.mouth.push({ t: now, gap, moving, looking: p.looking });
     while (p.mouth.length && now - p.mouth[0].t > MOUTH_LOG_MS) p.mouth.shift();
   }
@@ -622,12 +656,27 @@ export class GestureControl {
   private processFrame(events: GestureEvents) {
     if (!this.recognizer || !this.video || this.video.readyState < 2) return;
     const now = performance.now();
+    if (now - this.lastTick < VISION_MS) return;
+    this.lastTick = now;
     const vw = this.video.videoWidth || 1280;
     const vh = this.video.videoHeight || 720;
-    const res = this.recognizer.recognizeForVideo(this.video, now);
 
-    // every 2nd frame: people move slowly, but lips need ~15+ samples a second
-    const faceFrame = this.poseLandmarker && this.frameCount++ % 2 === 0;
+    const handTick = this.frameCount++ % 2 === 1;
+    if (handTick || !this.lastHands) {
+      // hands on a downscaled copy (landmarks come back normalized, so nothing else changes)
+      const hc = (this.handCanvas ??= document.createElement("canvas"));
+      const hw = Math.min(vw, HAND_INPUT_W);
+      const hh = Math.round((hw * vh) / vw);
+      if (hc.width !== hw || hc.height !== hh) {
+        hc.width = hw;
+        hc.height = hh;
+      }
+      hc.getContext("2d")!.drawImage(this.video, 0, 0, hw, hh);
+      this.lastHands = this.recognizer.recognizeForVideo(hc, now);
+    }
+    const res = this.lastHands;
+
+    const faceFrame = this.poseLandmarker && !handTick;
     if (faceFrame) {
       this.updatePersons(now, vw, vh);
       const ids = this.persons.map((p) => p.id);

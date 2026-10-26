@@ -69,8 +69,8 @@ export function renderParticipants(
     el.classList.toggle("hand-up", p.handUp);
     el.classList.toggle("holder", holder);
     el.classList.toggle("queued", queuePos >= 0);
-    const face = el.querySelector<HTMLCanvasElement>(".pt-face")!;
-    el.classList.toggle("has-face", !!drawFace?.(p.id, face));
+    // faces repaint less often than the rest — keep the last frame in between
+    if (drawFace) el.classList.toggle("has-face", drawFace(p.id, el.querySelector<HTMLCanvasElement>(".pt-face")!));
     el.classList.toggle("listened", holder && !!view!.listening);
 
     const role = el.querySelector<HTMLSpanElement>(".pt-role")!;

@@ -1390,6 +1390,7 @@ Object.assign(window, {
 
 const participantsEl = document.querySelector<HTMLDivElement>("#participants")!;
 let participantsAt = 0;
+let facesAt = 0;
 let breathAt = 0;
 // idle interference: every 25-70 s the channel hiccups on its own
 let idleGlitchAt = performance.now() + 25000 + Math.random() * 45000;
@@ -1441,10 +1442,15 @@ function frame() {
   if (now - participantsAt > 100) {
     participantsAt = now;
     const view = participantsPreview ?? (gestures && settings.handGestures ? gestures.snapshot() : null);
+    const paintFaces = now - facesAt >= 250;
+    if (paintFaces) facesAt = now;
     renderParticipants(
       participantsEl,
       view && { ...view, listening: state === "listening" },
-      participantsPreview ? undefined : (id, canvas) => gestures?.drawFace(id, canvas) ?? false
+      // faces repaint at 4 Hz — plenty for a thumbnail, cheap on the main thread
+      participantsPreview || !paintFaces
+        ? undefined
+        : (id, canvas) => gestures?.drawFace(id, canvas) ?? false
     );
     renderStatus();
   }
