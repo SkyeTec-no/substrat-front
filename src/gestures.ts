@@ -461,6 +461,16 @@ export class GestureControl {
     this.floor?.give(id);
   }
 
+  /** Hand the floor to this person regardless (they called Octa by name). */
+  takeFloor(id: number) {
+    this.floor?.force(id);
+  }
+
+  /** Is this person looking at Octa right now? */
+  isLooking(id: number): boolean {
+    return !!this.persons.find((p) => p.id === id)?.looking;
+  }
+
   /** Clear the floor and the queue — whoever raises a hand next takes it. */
   resetFloor() {
     this.floor?.reset();

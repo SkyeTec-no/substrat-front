@@ -16,7 +16,7 @@ import { GestureControl, captureCameraFrame, type HandState, type MeetingState }
 import { theme, setDarkMode, initTheme, onThemeChange } from "./theme";
 import { renderParticipants, type ParticipantView } from "./participants";
 import { VoiceBook } from "./voices";
-import { MeetingLog } from "./meeting";
+import { MeetingLog, type LogLine } from "./meeting";
 import { jevSettings, jevLog, jevLogCsv, checkAddressee, type JevMode } from "./jev";
 
 const canvas = document.querySelector<HTMLCanvasElement>("#scene")!;
@@ -563,7 +563,9 @@ async function converse(opts: { wakeOnly?: boolean; candidate?: number; given?: 
   // addressed by name with the floor free: answer them, and they have the floor
   if (heard && (opts.wakeOnly || opts.given)) {
     const who = opts.given?.who ?? opts.candidate ?? null;
-    if (!addressesOcta(heard) || (floorHolder !== null && floorHolder !== who)) {
+    // a call by name (given) was already decided on; a face-and-talk with the
+    // floor free still needs the name, and mustn't cut in on a holder
+    if (!addressesOcta(heard) || (opts.wakeOnly && floorHolder !== null && floorHolder !== who)) {
       // talk in the room, not to Octa — say nothing
       setState("idle");
       showTranscript("");
@@ -1033,8 +1035,20 @@ darkCheck.addEventListener("change", () => setDarkMode(darkCheck.checked));
 const meetingCheck = document.querySelector<HTMLInputElement>("#or-meeting-log")!;
 const recEl = document.querySelector<HTMLDivElement>("#rec")!;
 function renderRec() {
-  recEl.classList.toggle("visible", !!meeting?.enabled);
+  // the room is being transcribed either way — say which, always on screen
+  const minutes = !!meeting?.enabled;
+  const wake = !!meeting?.wake;
+  recEl.classList.toggle("visible", minutes || wake);
+  recEl.classList.toggle("wake", wake && !minutes);
+  recEl.textContent = minutes ? "referat" : "lytter etter «okta»";
 }
+const wakeCheck = document.querySelector<HTMLInputElement>("#or-wake")!;
+wakeCheck.checked = settings.wakeWord;
+wakeCheck.addEventListener("change", () => {
+  settings.wakeWord = wakeCheck.checked;
+  if (meeting) meeting.wake = wakeCheck.checked;
+  renderRec();
+});
 meetingCheck.checked = settings.meetingLog;
 meetingCheck.addEventListener("change", () => {
   settings.meetingLog = meetingCheck.checked;
@@ -1200,17 +1214,14 @@ startBtn.addEventListener("click", async () => {
     voices ??= new VoiceBook(mic);
     if (!meeting) {
       meeting = new MeetingLog(mic, voices, () => speaker.speaking || state === "listening" || noteMode);
-      // "Okta, …" heard in the room while nobody holds the floor (or by the
-      // holder): treat it as a request, from that person
+      // "Okta" anywhere in the room: collected for a beat, so several people
+      // calling at once can be told to take turns
       meeting.onLine = (line) => {
-        if (!addressesOcta(line.text) || state !== "idle" || speaker.speaking) return;
-        const m = /^P(\d+)$/.exec(line.who);
-        const id = m ? Number(m[1]) : null;
-        if (floorHolder !== null && floorHolder !== id) return;
-        converse({ given: { text: line.text, who: id } });
+        if (addressesOcta(line.text)) heardCall(line);
       };
     }
     meeting.enabled = settings.meetingLog;
+    meeting.wake = settings.wakeWord;
     renderRec();
   } catch {
     showTranscript("mikrofonen er utilgjengelig — bare visuelt");
@@ -1353,6 +1364,59 @@ let gestures: GestureControl | null = null;
 let floorHolder: number | null = null;
 let voices: VoiceBook | null = null; // who's speaking, by voice (learned from the camera)
 let meeting: MeetingLog | null = null; // minutes of everything said in the room (opt-in)
+
+// --- "Okta!": called by name, Octa always listens --------------------------
+
+let calls: LogLine[] = [];
+let callTimer = 0;
+
+function heardCall(line: LogLine) {
+  calls.push(line);
+  // a moment to hear if anyone else is calling too
+  if (!callTimer) callTimer = window.setTimeout(answerCall, 900);
+}
+
+async function answerCall() {
+  callTimer = 0;
+  const batch = calls;
+  calls = [];
+  if (!batch.length || noteMode) return;
+  const idOf = (who: string) => {
+    const m = /^P(\d+)$/.exec(who);
+    return m ? Number(m[1]) : null;
+  };
+  const callers = [...new Map(batch.map((l) => [l.who, l])).values()];
+  const crowd = callers.length > 1 || batch.some((l) => (l.talkers ?? 0) > 1);
+  // first pick: whoever already had the floor, then whoever is looking at
+  // Octa, then whoever called first
+  const pick =
+    callers.find((l) => idOf(l.who) !== null && idOf(l.who) === floorHolder) ??
+    callers.find((l) => idOf(l.who) !== null && gestures?.isLooking(idOf(l.who)!)) ??
+    callers[0];
+  const id = idOf(pick.who);
+  // being called beats whatever Octa was doing — but never cut a capture
+  if (state === "listening") return;
+  if (state === "thinking" || state === "speaking") interrupt();
+  if (id !== null) gestures?.takeFloor(id);
+  if (crowd) {
+    setState("speaking");
+    const msg = id !== null ? `Rolig nå, én om gangen. P${id}, du først.` : "Rolig nå, én om gangen.";
+    showTranscript(msg);
+    await speaker.speak(msg, () => {
+      scene.pulse(1);
+      speakLevel = 0.5;
+    });
+    setState("idle");
+  }
+  // "Okta, hva tenker du om det?" — answer it; a bare "Okta!" — listen
+  const rest = pick.text.replace(/(?<!\p{L})(okta|octa|åkta|okka|oktan)(?!\p{L})[\s,.!?:]*/giu, " ").trim();
+  if (!crowd && rest.split(/\s+/).filter(Boolean).length >= 2) {
+    converse({ given: { text: pick.text, who: id } });
+  } else {
+    sound?.ping(1568, 0.07);
+    converse();
+  }
+}
 let meetingPersons = 0;
 
 // One mediator for highlight focus: hand hover beats mouse hover.
@@ -1499,7 +1563,7 @@ Object.assign(window, {
     scene, agentEvents, setState, presentArtifacts, salvageVisualFromText, visualsEl,
     jevLog, jevLogCsv, checkAddressee, converse, setTier,
     // for scripted runs: patch Recognizer.prototype / speaker to feed text in
-    Recognizer, speaker, idleGlitch,
+    Recognizer, speaker, idleGlitch, heardCall,
     previewParticipants: (v: ParticipantView | null) => (participantsPreview = v),
     get gestures() { return gestures; },
     get state() { return state; },
@@ -1557,7 +1621,7 @@ function frame() {
     idleGlitch();
   }
   // minutes: the room VAD runs whether or not the camera is on
-  if (meeting?.enabled) meeting.tick(mic.level());
+  if (meeting?.enabled || meeting?.wake) meeting.tick(mic.level());
   // the respirator keeps going while Octa thinks
   if (state === "thinking" && settings.voiceStyle === "vader" && !speaker.speaking && now - breathAt > 4800) {
     breathAt = now;

@@ -75,6 +75,9 @@ export const settings = {
   /** In a meeting, start listening when the floor holder looks at Octa and talks. */
   get autoListen() { return localStorage.getItem("octa-auto-listen") !== "0"; },
   set autoListen(v: boolean) { localStorage.setItem("octa-auto-listen", v ? "1" : "0"); },
+  /** Listen for "Okta" in the room (transcribes speech to spot the name; on by default). */
+  get wakeWord() { return localStorage.getItem("octa-wake") !== "0"; },
+  set wakeWord(v: boolean) { localStorage.setItem("octa-wake", v ? "1" : "0"); },
   /** Keep minutes of the whole meeting (transcribes everything said in the room). */
   get meetingLog() { return localStorage.getItem("octa-meeting-log") === "1"; },
   set meetingLog(v: boolean) { localStorage.setItem("octa-meeting-log", v ? "1" : "0"); },

@@ -563,6 +563,10 @@ body {
 
 #rec.visible { display: flex; }
 
+/* only listening for the name: quieter than the red minutes mark, still there */
+#rec.wake { color: var(--dim); }
+#rec.wake::before { background: var(--dim); animation: none; border-radius: 50%; }
+
 #rec::before {
   content: "";
   width: 8px;

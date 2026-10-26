@@ -75,6 +75,11 @@ export class Floor {
     if (this.holder === null) this.grant(id);
   }
 
+  /** Called by name: they take the floor, whoever had it. */
+  force(id: number) {
+    if (this.holder !== id) this.grant(id);
+  }
+
   reset() {
     this.holder = null;
     this.queue = [];

@@ -20,6 +20,8 @@ export interface LogLine {
   who: string; // "P2", "Octa", or "?"
   text: string;
   toOcta?: boolean; // a request to Octa (vs. talk in the room)
+  /** How many people's lips moved during this utterance (2+ = people talking over each other). */
+  talkers?: number;
 }
 
 const START_LEVEL = 0.1; // mic level that opens an utterance
@@ -30,7 +32,10 @@ const RECENT_CHARS = 3500; // verbatim transcript handed to the model
 const SUMMARIZE_AFTER = 6000; // fold older lines into the summary past this
 
 export class MeetingLog {
+  /** Keep minutes: store every line and hand the meeting to the model. */
   enabled = false;
+  /** Listen for "Okta" in the room: transcribe, check, and drop (unless minutes are on). */
+  wake = false;
   lines: LogLine[] = [];
   summary = "";
   private summarized = 0; // lines[0..summarized) are folded into the summary
@@ -61,7 +66,7 @@ export class MeetingLog {
 
   /** ~10×/s: the VAD. Pauses while Octa talks or takes a command itself. */
   tick(level: number) {
-    if (!this.enabled) return;
+    if (!this.enabled && !this.wake) return;
     const now = performance.now();
     if (this.paused()) {
       this.seg = null; // Octa's own voice and its command captures aren't room talk
@@ -114,18 +119,21 @@ export class MeetingLog {
       ]);
       if (!text || text.length < 2) return;
       // who: a recognised voice first; else whoever's lips moved most meanwhile
+      const counts = new Map<number, number>();
+      for (const s of this.talkers) {
+        if (s.t < t0 || s.t > t1) continue;
+        for (const id of s.ids) counts.set(id, (counts.get(id) ?? 0) + 1);
+      }
       let who = voice?.id != null ? `P${voice.id}` : "";
       if (!who) {
-        const counts = new Map<number, number>();
-        for (const s of this.talkers) {
-          if (s.t < t0 || s.t > t1) continue;
-          for (const id of s.ids) counts.set(id, (counts.get(id) ?? 0) + 1);
-        }
         const top = [...counts].sort((a, b) => b[1] - a[1])[0];
         who = top ? `P${top[0]}` : "?";
       }
-      const line = { at: Date.now() - Math.round(performance.now() - t0), who, text };
-      this.lines.push(line);
+      // several mouths moving for a fair share of the utterance = talking over each other
+      const frames = this.talkers.filter((s) => s.t >= t0 && s.t <= t1).length || 1;
+      const talkers = [...counts.values()].filter((n) => n / frames > 0.25).length;
+      const line = { at: Date.now() - Math.round(performance.now() - t0), who, text, talkers };
+      if (this.enabled) this.lines.push(line);
       this.onLine(line);
       console.info(`[meeting] ${who}: ${text}`);
       void this.maybeSummarize();
