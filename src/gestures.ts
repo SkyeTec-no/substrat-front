@@ -280,6 +280,11 @@ export class GestureControl {
   private frameCount = 0;
   private lastTick = 0;
   private poseTicks = 0;
+  private candidates: { cx: number; cy: number; w: number; seen: number; at: number }[] = [];
+  private gone: {
+    id: number; cx: number; cy: number; w: number;
+    portrait: HTMLCanvasElement | null; portraitAt: number; at: number;
+  }[] = [];
   private handCanvas: HTMLCanvasElement | null = null;
   private lastHands: GestureRecognizerResult | null = null;
   private earSince = 0;
@@ -451,6 +456,8 @@ export class GestureControl {
     this.stream = null;
     this.floor = null;
     this.persons = [];
+    this.candidates = [];
+    this.gone = [];
     this.tracks = [];
     this.lastPersonIds = "";
     this.lastMid = this.lastSpread = this.lastPinchSize = null;
@@ -492,11 +499,31 @@ export class GestureControl {
           lm.map((l) => ({ x: tile.x + l.x * tile.w, y: tile.y + l.y * tile.h, v: l.visibility ?? 1 })),
           now,
           vw,
-          vh
+          vh,
+          tile
         );
       }
     }
+    // people who've gone quiet for a while leave — remembered for a minute
+    for (const p of this.persons) {
+      if (now - p.lastSeen >= PERSON_TTL) {
+        this.gone.push({ id: p.id, cx: p.cx, cy: p.cy, w: p.w, portrait: p.portrait, portraitAt: p.portraitAt, at: now });
+      }
+    }
     this.persons = this.persons.filter((p) => now - p.lastSeen < PERSON_TTL);
+    this.gone = this.gone.filter((g) => now - g.at < 60_000);
+    this.candidates = this.candidates.filter((c) => now - c.at < 1500);
+    // two tracks on one head (overlapping tiles) — the older one stays
+    for (const p of [...this.persons]) {
+      const twin = this.persons.find(
+        (q) => q !== p && q.id < p.id && Math.hypot(q.cx - p.cx, q.cy - p.cy) < Math.max(q.w, p.w) * 0.8
+      );
+      if (twin) {
+        twin.portrait ??= p.portrait;
+        twin.lastSeen = Math.max(twin.lastSeen, p.lastSeen);
+        this.persons = this.persons.filter((q) => q !== p);
+      }
+    }
 
     // face crops: the floor holder every time (their lips gate speech), plus
     // one other person in turn
@@ -509,7 +536,13 @@ export class GestureControl {
   }
 
   /** One detected body (landmarks in video px): match it to a person and update them. */
-  private seePose(pts: { x: number; y: number; v: number }[], now: number, vw: number, vh: number) {
+  private seePose(
+    pts: { x: number; y: number; v: number }[],
+    now: number,
+    vw: number,
+    vh: number,
+    tile: { x: number; y: number; w: number; h: number }
+  ) {
     const vis = (i: number) => (pts[i]?.v ?? 0) > 0.5;
     const dist = (a: number, b: number) => Math.hypot(pts[a].x - pts[b].x, pts[a].y - pts[b].y);
     // 0 nose · 2/5 eyes · 7/8 ears · 11/12 shoulders · 15/16 wrists
@@ -525,6 +558,21 @@ export class GestureControl {
       24
     );
     const h = w * 1.3;
+
+    // A tile only sees part of the frame: a body cut by an inner tile edge
+    // gives a wrong head, and someone close to the camera is too big for a
+    // tile at all. The full frame (or the neighbouring tile) covers them.
+    const full = tile.w === vw && tile.h === vh;
+    if (!full) {
+      if (w > tile.w * 0.3) return;
+      const m = Math.max(w * 0.6, tile.w * 0.05);
+      const nearInner =
+        (cx - tile.x < m && tile.x > 0) ||
+        (tile.x + tile.w - cx < m && tile.x + tile.w < vw) ||
+        (cy - tile.y < m && tile.y > 0) ||
+        (tile.y + tile.h - cy < m && tile.y + tile.h < vh);
+      if (nearInner) return;
+    }
     // facing the camera: nose centred between both visible ears
     let poseFacing = false;
     if (vis(0) && vis(7) && vis(8)) {
@@ -550,10 +598,25 @@ export class GestureControl {
       best.w += (w - best.w) * 0.5;
       best.h += (h - best.h) * 0.5;
     } else {
+      // a stranger must show up twice before they get a number — one stray
+      // detection shouldn't mint a new person
+      const cand = this.candidates.find((c) => Math.hypot(c.cx - cx, c.cy - cy) < Math.max(c.w, w) * 1.2);
+      if (!cand) {
+        this.candidates.push({ cx, cy, w, seen: 1, at: now });
+        return;
+      }
+      cand.cx = cx;
+      cand.cy = cy;
+      cand.w = w;
+      cand.at = now;
+      if (++cand.seen < 2) return;
+      this.candidates = this.candidates.filter((c) => c !== cand);
+      // someone who just left and came back keeps their number and portrait
+      const ghost = this.reclaim(cx, cy, w);
       best = {
-        id: this.nextPersonId++, cx, cy, w, h, top: 0, ears, wrists, lastSeen: now,
+        id: ghost?.id ?? this.nextPersonId++, cx, cy, w, h, top: 0, ears, wrists, lastSeen: now,
         poseFacing, faceAt: 0, raiseSince: 0, raiseFired: false,
-        portrait: null, portraitAt: 0,
+        portrait: ghost?.portrait ?? null, portraitAt: ghost?.portraitAt ?? 0,
         mouth: [], lookEma: 0, looking: false,
       };
       this.persons.push(best);
@@ -578,6 +641,17 @@ export class GestureControl {
         this.floor?.raise(best.id);
       }
     }
+  }
+
+  /** A recently departed person near (cx, cy) — or, if nobody is in view at all,
+   *  whoever left last — so a returning person keeps their number. */
+  private reclaim(cx: number, cy: number, w: number) {
+    const near = this.gone
+      .filter((g) => Math.hypot(g.cx - cx, g.cy - cy) < Math.max(g.w, w) * 3)
+      .sort((a, b) => Math.hypot(a.cx - cx, a.cy - cy) - Math.hypot(b.cx - cx, b.cy - cy))[0];
+    const pick = near ?? (this.persons.length === 0 ? this.gone.at(-1) : undefined);
+    if (pick) this.gone = this.gone.filter((g) => g !== pick);
+    return pick;
   }
 
   private updateLook(p: Person, facingNow: boolean) {
