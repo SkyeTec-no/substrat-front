@@ -352,6 +352,7 @@ body {
   background: var(--who);
   transform: scaleX(0.18);
   transform-origin: left;
+  z-index: 2;
   transition: transform 0.45s cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
@@ -368,6 +369,30 @@ body {
   from { opacity: 0; transform: translateY(6px); }
   to { opacity: 1; transform: none; }
 }
+
+/* the person's live face fills the tile: monochrome and quiet, so the numeral
+   and status still read — full strength while they face Octa or hold the floor */
+.pt-face {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  filter: grayscale(1) contrast(1.15) brightness(1.05);
+  transition: opacity 0.4s, filter 0.4s;
+}
+
+.pt.has-face .pt-face { opacity: 0.42; }
+.pt.has-face.looking .pt-face,
+.pt.has-face.holder .pt-face { opacity: 0.85; }
+.pt.has-face.holder .pt-face { filter: grayscale(0.35) contrast(1.1); }
+
+/* keep the corner marks and numeral legible over a face */
+.pt.has-face .pt-num { text-shadow: 0 0 6px var(--bg), 0 0 2px var(--bg); }
+.pt.has-face .pt-gaze,
+.pt.has-face .pt-meter { filter: drop-shadow(0 0 2px var(--bg)); }
+
+.pt-gaze, .pt-hand, .pt-mic, .pt-meter, .pt-num { z-index: 1; }
 
 .pt-num {
   position: absolute;

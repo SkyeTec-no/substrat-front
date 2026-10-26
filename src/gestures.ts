@@ -82,7 +82,9 @@ const SPOKE_TO_OCTA_MS = 300; // lips moving while facing Octa
 const SPOKE_LOOSE_MS = 450; // lips moving, facing Octa for part of it
 const SPOKE_ALONE_MS = 250; // only one face in view: lips moving at all
 // "looking at Octa" = face turned toward the camera (which sits by the screen):
-const GAZE_YAW = 0.13; // nose offset from the cheek midpoint, share of face width
+// In a room people sit along the table and turn their heads to the screen at
+// the end: faces aimed at the camera measured ±0.18-0.26 in a test frame.
+const GAZE_YAW = 0.3; // nose offset from the cheek midpoint, share of face width
 const GAZE_PITCH: [number, number] = [0.22, 0.62]; // nose between eye line (0) and chin (1)
 const GAZE_IRIS = 0.2; // irises off-center in their eyes by more than this → looking aside
 
@@ -359,6 +361,24 @@ export class GestureControl {
     };
   }
 
+  /** Paint a person's face (head and a little shoulder) into a canvas, mirrored
+   *  like everything else on screen. False if they're not in view. */
+  drawFace(id: number, canvas: HTMLCanvasElement): boolean {
+    const p = this.persons.find((q) => q.id === id);
+    const video = this.video;
+    if (!p || !video || video.readyState < 2) return false;
+    const side = Math.max(p.w * 2.2, 72);
+    const sx = Math.max(0, Math.min(video.videoWidth - side, p.cx - side / 2));
+    const sy = Math.max(0, Math.min(video.videoHeight - side, p.cy - side * 0.45));
+    const ctx = canvas.getContext("2d")!;
+    ctx.save();
+    ctx.translate(canvas.width, 0);
+    ctx.scale(-1, 1);
+    ctx.drawImage(video, sx, sy, side, side, 0, 0, canvas.width, canvas.height);
+    ctx.restore();
+    return true;
+  }
+
   /** Whether the floor holder's lips moved since `since` (performance.now()).
    *  null when it can't be judged — no floor, or their face was mostly out of
    *  view — in which case the caller should give them the benefit of the doubt. */
@@ -480,7 +500,7 @@ export class GestureControl {
     let poseFacing = false;
     if (vis(0) && vis(7) && vis(8)) {
       const yaw = (pts[0].x - (pts[7].x + pts[8].x) / 2) / Math.max(1, dist(7, 8));
-      poseFacing = Math.abs(yaw) < 0.2;
+      poseFacing = Math.abs(yaw) < 0.35;
     }
     const ears = [7, 8].filter(vis).map((i) => ({ x: pts[i].x / vw, y: pts[i].y / vh }));
     const wrists = [15, 16].filter(vis).map((i) => ({ x: pts[i].x, y: pts[i].y }));

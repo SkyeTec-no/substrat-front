@@ -1381,6 +1381,7 @@ Object.assign(window, {
     // for scripted runs: patch Recognizer.prototype / speaker to feed text in
     Recognizer, speaker, idleGlitch,
     previewParticipants: (v: ParticipantView | null) => (participantsPreview = v),
+    get gestures() { return gestures; },
     get state() { return state; },
     get tier() { return settings.tier; },
     get sound() { return sound; },
@@ -1440,7 +1441,11 @@ function frame() {
   if (now - participantsAt > 100) {
     participantsAt = now;
     const view = participantsPreview ?? (gestures && settings.handGestures ? gestures.snapshot() : null);
-    renderParticipants(participantsEl, view && { ...view, listening: state === "listening" });
+    renderParticipants(
+      participantsEl,
+      view && { ...view, listening: state === "listening" },
+      participantsPreview ? undefined : (id, canvas) => gestures?.drawFace(id, canvas) ?? false
+    );
     renderStatus();
   }
   const m = scene.getMotion();

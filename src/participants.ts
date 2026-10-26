@@ -31,6 +31,7 @@ function createTile(id: number): HTMLDivElement {
   el.style.setProperty("--who", `var(--person-${(id - 1) % 6})`);
   // numeral-led square: status lives in the corners, words only for the floor
   el.innerHTML = `
+    <canvas class="pt-face" width="136" height="136"></canvas>
     <span class="pt-gaze" title="ser på Octa">${svg(EYE, "on")}${svg(EYE_OFF, "off")}</span>
     <span class="pt-hand" title="hånd oppe">${svg(HAND, "")}</span>
     <span class="pt-mic" title="Octa lytter">${svg(MIC, "")}</span>
@@ -40,7 +41,12 @@ function createTile(id: number): HTMLDivElement {
   return el;
 }
 
-export function renderParticipants(root: HTMLElement, view: ParticipantView | null) {
+/** drawFace paints a person's live face crop into their tile (false = no face). */
+export function renderParticipants(
+  root: HTMLElement,
+  view: ParticipantView | null,
+  drawFace?: (id: number, canvas: HTMLCanvasElement) => boolean
+) {
   const persons = view?.persons ?? [];
   root.classList.toggle("visible", persons.length > 0);
 
@@ -63,6 +69,8 @@ export function renderParticipants(root: HTMLElement, view: ParticipantView | nu
     el.classList.toggle("hand-up", p.handUp);
     el.classList.toggle("holder", holder);
     el.classList.toggle("queued", queuePos >= 0);
+    const face = el.querySelector<HTMLCanvasElement>(".pt-face")!;
+    el.classList.toggle("has-face", !!drawFace?.(p.id, face));
     el.classList.toggle("listened", holder && !!view!.listening);
 
     const role = el.querySelector<HTMLSpanElement>(".pt-role")!;
