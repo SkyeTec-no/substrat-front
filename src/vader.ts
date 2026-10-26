@@ -310,6 +310,59 @@ export class VaderVoice {
     o.stop(at + 0.05);
   }
 
+  /** Open the audio context inside a user gesture (the Begin click), so idle
+   *  sounds can play before Octa has said anything. */
+  prime() {
+    void this.audio().resume();
+  }
+
+  /** Idle interference: a short crackle of crushed static through the room,
+   *  sometimes with a ghost of a tone — the channel hiccuping on its own. */
+  staticBurst(strength = 1) {
+    if (this.speaking) return;
+    const ctx = this.audio();
+    if (ctx.state !== "running") return; // never resume audio without a user gesture
+    const t = ctx.currentTime;
+    const dur = 0.12 + Math.random() * 0.18 * strength;
+    const noise = ctx.createBuffer(1, Math.ceil(ctx.sampleRate * dur), ctx.sampleRate);
+    const c = noise.getChannelData(0);
+    // sample-and-hold noise: chunky, digital rather than hissy
+    const hold = 6 + Math.floor(Math.random() * 30);
+    let v = 0;
+    for (let i = 0; i < c.length; i++) {
+      if (i % hold === 0) v = Math.random() * 2 - 1;
+      c[i] = v * (Math.random() < 0.92 ? 1 : 0); // dropouts
+    }
+    const src = ctx.createBufferSource();
+    src.buffer = noise;
+    const bp = ctx.createBiquadFilter();
+    bp.type = "bandpass";
+    bp.frequency.value = 900 + Math.random() * 2400;
+    bp.Q.value = 1.2;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.05 * strength, t + 0.01);
+    g.gain.setValueAtTime(0.05 * strength, t + dur * 0.7);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    src.connect(bp).connect(g).connect(ctx.destination);
+    g.connect(this.room!);
+    src.start(t);
+    if (Math.random() < 0.4) {
+      // a tone bleeding through the static
+      const o = ctx.createOscillator();
+      o.type = "square";
+      o.frequency.setValueAtTime(110 + Math.random() * 220, t);
+      const og = ctx.createGain();
+      og.gain.setValueAtTime(0.0001, t);
+      og.gain.exponentialRampToValueAtTime(0.02 * strength, t + 0.01);
+      og.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      o.connect(og).connect(this.room!);
+      og.connect(ctx.destination);
+      o.start(t);
+      o.stop(t + dur + 0.02);
+    }
+  }
+
   /** One full in-out cycle — the idle sound while Octa is thinking. */
   breatheCycle() {
     if (this.speaking) return;

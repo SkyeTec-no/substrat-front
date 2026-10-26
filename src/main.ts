@@ -994,6 +994,7 @@ startBtn.addEventListener("click", async () => {
   // warm up the TTS voice list (loads async in most browsers)
   speechSynthesis.getVoices();
   warmVoice(); // fillers and confirmations ready before they're needed
+  speaker.vader.prime();
 
   if (settings.handGestures) enableHandGestures();
 });
@@ -1285,7 +1286,7 @@ Object.assign(window, {
     scene, agentEvents, setState, presentArtifacts, salvageVisualFromText, visualsEl,
     jevLog, jevLogCsv, checkAddressee, converse, setTier,
     // for scripted runs: patch Recognizer.prototype / speaker to feed text in
-    Recognizer, speaker,
+    Recognizer, speaker, idleGlitch,
     previewParticipants: (v: ParticipantView | null) => (participantsPreview = v),
     get state() { return state; },
     get tier() { return settings.tier; },
@@ -1296,6 +1297,22 @@ Object.assign(window, {
 const participantsEl = document.querySelector<HTMLDivElement>("#participants")!;
 let participantsAt = 0;
 let breathAt = 0;
+// idle interference: every 25-70 s the channel hiccups on its own
+let idleGlitchAt = performance.now() + 25000 + Math.random() * 45000;
+
+function idleGlitch() {
+  const strength = 0.5 + Math.random() * 0.5;
+  const ms = 140 + Math.random() * 200;
+  scene.glitch(strength, ms);
+  if (settings.voiceStyle === "vader") speaker.vader.staticBurst(strength);
+  // now and then it stutters twice
+  if (Math.random() < 0.3) {
+    setTimeout(() => {
+      scene.glitch(strength * 0.7, ms * 0.7);
+      if (settings.voiceStyle === "vader") speaker.vader.staticBurst(strength * 0.6);
+    }, ms + 90 + Math.random() * 160);
+  }
+}
 // set from the console (octa.previewParticipants) to style the strip without a camera
 let participantsPreview: ParticipantView | null = null;
 
@@ -1312,6 +1329,16 @@ function frame() {
   drawCamView();
   // participant tiles: 10 updates a second is plenty for gaze and hands
   const now = performance.now();
+  if (
+    state === "idle" &&
+    now > idleGlitchAt &&
+    overlay.classList.contains("hidden") &&
+    document.visibilityState === "visible" &&
+    !speaker.speaking
+  ) {
+    idleGlitchAt = now + 25000 + Math.random() * 45000;
+    idleGlitch();
+  }
   // the respirator keeps going while Octa thinks
   if (state === "thinking" && settings.voiceStyle === "vader" && !speaker.speaking && now - breathAt > 4800) {
     breathAt = now;
